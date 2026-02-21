@@ -50,7 +50,7 @@ function formatRelativeDate(dateStr: string): string {
 function NextCatalystCard({
   nextCatalyst,
 }: {
-  nextCatalyst: CatalystResponse["nextCatalyst"];
+  nextCatalyst: CatalystResponse["nextCatalystDetails"];
 }) {
   if (!nextCatalyst) return null;
 
@@ -342,7 +342,7 @@ export default function CatalystCalendar({ screenId }: CatalystCalendarProps) {
       </div>
 
       {/* Next Catalyst Highlight */}
-      <NextCatalystCard nextCatalyst={data.nextCatalyst} />
+      <NextCatalystCard nextCatalyst={data.nextCatalystDetails} />
 
       {/* Timeline */}
       <div role="list" aria-label="Catalyst timeline">

@@ -16,7 +16,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.services.workflow_engine import cancel_workflow, start_workflow
 
@@ -723,6 +723,7 @@ def get_screen_refresh_claims(
 
     claims = (
         db.query(ISTClaim)
+        .options(joinedload(ISTClaim.source_refresh))
         .filter(
             ISTClaim.screen_id == screen_id,
             ISTClaim.source_refresh_id == refresh_id,
@@ -746,6 +747,10 @@ def get_screen_refresh_claims(
                 "isValidated": bool(claim.is_validated),
                 "validationVerdict": claim.validation_verdict,
                 "validationSource": claim.validation_source,
+                "sourceRefreshId": claim.source_refresh_id,
+                "sourceRefreshNumber": (
+                    claim.source_refresh.refresh_number if claim.source_refresh else None
+                ),
                 "createdAt": claim.created_at.isoformat() if claim.created_at else None,
             }
             for claim in claims
@@ -969,7 +974,11 @@ def get_screen_claims(
             detail=_error("SCREEN_NOT_FOUND", f"No screen with id {screen_id}"),
         )
 
-    query = db.query(ISTClaim).filter(ISTClaim.screen_id == screen_id)
+    query = (
+        db.query(ISTClaim)
+        .options(joinedload(ISTClaim.source_refresh))
+        .filter(ISTClaim.screen_id == screen_id)
+    )
 
     if validated is not None:
         query = query.filter(
@@ -1008,6 +1017,10 @@ def get_screen_claims(
             "isValidated": bool(c.is_validated),
             "validationVerdict": c.validation_verdict,
             "validationSource": c.validation_source,
+            "sourceRefreshId": c.source_refresh_id,
+            "sourceRefreshNumber": (
+                c.source_refresh.refresh_number if c.source_refresh else None
+            ),
         }
         for c in claims
     ]

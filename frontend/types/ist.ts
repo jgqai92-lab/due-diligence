@@ -34,9 +34,13 @@ export interface ISTScreenListItem {
   name: string;
   status: ISTScreenStatus;
   workflowRunId: number;
+  activeWorkflowRunId: number | null;
   claimCount: number;
   candidateCount: number;
   tier1Count: number;
+  refreshCount: number;
+  isRefreshing: boolean;
+  lastRefreshedAt: string | null;
   currentPhase: number;
   createdAt: string;
   updatedAt: string;
@@ -47,6 +51,7 @@ export interface ISTScreenListItem {
 export interface ISTScreenDetail {
   id: number;
   workflowRunId: number;
+  activeWorkflowRunId: number | null;
   name: string;
   status: ISTScreenStatus;
   contentType: ContentType;
@@ -69,6 +74,9 @@ export interface ISTScreenDetail {
     sourceCredibility: string;
     potentialBlindSpots: string[];
   } | null;
+  refreshCount: number;
+  isRefreshing: boolean;
+  lastRefreshedAt: string | null;
   currentPhase: number;
   isCertified: boolean;
   certifiedAt: string | null;
@@ -76,6 +84,35 @@ export interface ISTScreenDetail {
   hfrtHandoff: HandoffData | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ISTRefreshListItem {
+  id: number;
+  workflowRunId: number;
+  refreshNumber: number;
+  status: string;
+  contentType: ContentType;
+  deltaClaimCount: number;
+  stepsReexecuted: string[] | null;
+  impactAssessment: Record<string, unknown> | null;
+  errorMessage: string | null;
+  isActive: boolean;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string | null;
+}
+
+export interface ISTRefreshDetail extends ISTRefreshListItem {
+  screenId: number;
+  deltaContent: string;
+  refreshNotes: Record<string, unknown> | null;
+}
+
+export interface ISTRefreshClaimsResponse {
+  screenId: number;
+  refreshId: number;
+  claims: ISTClaim[];
+  totalCount: number;
 }
 
 // ─── Claim ──────────────────────────────────────────────────────────
@@ -91,6 +128,8 @@ export interface ISTClaim {
   isValidated: boolean;
   validationVerdict: ValidationVerdict | null;
   validationSource: string | null;
+  sourceRefreshId?: number | null;
+  sourceRefreshNumber?: number | null;
 }
 
 // ─── Bottleneck Map ────────────────────────────────────────────────
@@ -367,7 +406,8 @@ export interface CatalystResponse {
   screenId: number;
   catalysts: CatalystEvent[];
   totalCatalysts: number;
-  nextCatalyst: { date: string; event: string; daysUntil: number } | null;
+  nextCatalyst: string | null;
+  nextCatalystDetails: { date: string; event: string; daysUntil: number } | null;
 }
 
 // ─── Stress Tests ─────────────────────────────────────────────────
@@ -387,7 +427,8 @@ export interface StressTestResponse {
     scenarios: Array<{ scenario: string; impactSeverity: string; survivalScore: number }>;
     overallSurvivalScore: number;
   }>;
-  survivalScores: {
+  survivalScores: Array<Record<string, unknown>>;
+  survivalSummary: {
     averageTier1: number;
     averageTier2: number;
     lowestSurvivor: { ticker: string; score: number };
@@ -423,6 +464,18 @@ export interface FrameworkListResponse {
 
 export interface ReportResponse {
   screenId: number;
+  title: string;
+  content: string;
+  metadata: {
+    pillarCount: number;
+    equityCount: number;
+    tier1Count: number;
+    tier2Count: number;
+    tier3Count: number;
+    wordCount: number;
+    generatedAt?: string;
+    model: string;
+  };
   report: {
     id: number;
     title: string;

@@ -40,7 +40,7 @@ function survivalBarColor(score: number): string {
 function SurvivalSummary({
   scores,
 }: {
-  scores: StressTestResponse["survivalScores"];
+  scores: StressTestResponse["survivalSummary"];
 }) {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
@@ -396,8 +396,8 @@ export default function StressTests({ screenId }: StressTestsProps) {
   return (
     <div className="space-y-6 animate-fade-in">
       {/* Survival Score Summary */}
-      {data.survivalScores && (
-        <SurvivalSummary scores={data.survivalScores} />
+      {data.survivalSummary && (
+        <SurvivalSummary scores={data.survivalSummary} />
       )}
 
       {/* Framework-level Tests */}

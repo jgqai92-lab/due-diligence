@@ -67,14 +67,14 @@ export default function IdeaScreenPanel({ projectId, template }: IdeaScreenPanel
                 <p className="text-sm font-mono text-text-primary">{Number(raw.scarcityScore).toFixed(1)}</p>
               </div>
             )}
-            {raw.bottleneckExposure && (
+            {raw.bottleneckExposure != null && (
               <div>
                 <p className="text-xs text-text-secondary">Bottleneck Exposure</p>
                 <p className="text-sm text-text-primary">{String(raw.bottleneckExposure)}</p>
               </div>
             )}
           </div>
-          {raw.catalyst && (
+          {raw.catalyst != null && (
             <div className="mt-3 pt-3 border-t border-border">
               <p className="text-xs text-text-secondary mb-1">Key Catalyst</p>
               <p className="text-sm text-text-primary">{String(raw.catalyst)}</p>

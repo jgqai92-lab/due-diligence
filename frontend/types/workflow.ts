@@ -1,4 +1,4 @@
-export type WorkflowType = 'IST' | 'HFRT';
+export type WorkflowType = 'IST' | 'HFRT' | 'IST_SYNTHESIS' | 'IST_REFRESH';
 
 export type WorkflowStatus =
   | 'PENDING' | 'RUNNING' | 'PAUSED'

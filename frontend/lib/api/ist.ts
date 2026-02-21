@@ -15,6 +15,9 @@ import type {
   RotationResponse,
   CatalystResponse,
   StressTestResponse,
+  ISTRefreshListItem,
+  ISTRefreshDetail,
+  ISTRefreshClaimsResponse,
   ReportResponse,
   CertificationResponse,
   HandoffResponse,
@@ -63,7 +66,14 @@ export async function createScreen(data: {
   constraints?: Record<string, unknown>;
   frameworks?: string[];
   autoAdvance?: boolean;
-}): Promise<{ id: number; workflowRunId: number; name: string; status: string }> {
+}): Promise<{
+  id: number;
+  workflowRunId: number;
+  activeWorkflowRunId: number;
+  name: string;
+  status: string;
+  refreshCount: number;
+}> {
   const res = await fetch(`${API_BASE}/api/ist/screens`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -277,7 +287,12 @@ export async function getCatalysts(screenId: number): Promise<CatalystResponse> 
     headers: { 'Content-Type': 'application/json' },
   });
   if (!res.ok) await handleErrorResponse(res);
-  return res.json();
+  const data = await res.json();
+  return {
+    ...data,
+    nextCatalystDetails: data.nextCatalystDetails ?? null,
+    nextCatalyst: typeof data.nextCatalyst === "string" ? data.nextCatalyst : null,
+  };
 }
 
 // ─── Get Stress Tests ──────────────────────────────────────────
@@ -287,7 +302,16 @@ export async function getStressTests(screenId: number): Promise<StressTestRespon
     headers: { 'Content-Type': 'application/json' },
   });
   if (!res.ok) await handleErrorResponse(res);
-  return res.json();
+  const data = await res.json();
+  return {
+    ...data,
+    survivalScores: Array.isArray(data.survivalScores) ? data.survivalScores : [],
+    survivalSummary: data.survivalSummary ?? {
+      averageTier1: 0,
+      averageTier2: 0,
+      lowestSurvivor: { ticker: "", score: 0 },
+    },
+  };
 }
 
 // ─── Get Report ─────────────────────────────────────────────────
@@ -297,7 +321,20 @@ export async function getReport(screenId: number): Promise<ReportResponse> {
     headers: { 'Content-Type': 'application/json' },
   });
   if (!res.ok) await handleErrorResponse(res);
-  return res.json();
+  const data = await res.json();
+  const report = data.report ?? {
+    id: 0,
+    title: data.title,
+    content: data.content,
+    metadata: data.metadata,
+  };
+  return {
+    ...data,
+    title: data.title ?? report.title,
+    content: data.content ?? report.content,
+    metadata: data.metadata ?? report.metadata,
+    report,
+  };
 }
 
 // ─── Get Frameworks List ────────────────────────────────────────
@@ -382,6 +419,65 @@ export async function rerunScreen(id: number): Promise<{
   const res = await fetch(`${API_BASE}/api/ist/screens/${id}/rerun`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) await handleErrorResponse(res);
+  return res.json();
+}
+
+export async function createScreenRefresh(
+  id: number,
+  data: {
+    content: string;
+    contentType?: string;
+    autoAdvance?: boolean;
+    idempotencyKey?: string;
+  }
+): Promise<{
+  id: number;
+  screenId: number;
+  workflowRunId: number;
+  refreshNumber: number;
+  status: string;
+  warning?: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/ist/screens/${id}/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) await handleErrorResponse(res);
+  return res.json();
+}
+
+export async function listScreenRefreshes(id: number): Promise<{
+  screenId: number;
+  refreshes: ISTRefreshListItem[];
+  total: number;
+}> {
+  const res = await fetch(`${API_BASE}/api/ist/screens/${id}/refreshes`, {
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!res.ok) await handleErrorResponse(res);
+  return res.json();
+}
+
+export async function getScreenRefresh(
+  screenId: number,
+  refreshId: number
+): Promise<ISTRefreshDetail> {
+  const res = await fetch(`${API_BASE}/api/ist/screens/${screenId}/refreshes/${refreshId}`, {
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!res.ok) await handleErrorResponse(res);
+  return res.json();
+}
+
+export async function getScreenRefreshClaims(
+  screenId: number,
+  refreshId: number
+): Promise<ISTRefreshClaimsResponse> {
+  const res = await fetch(`${API_BASE}/api/ist/screens/${screenId}/refreshes/${refreshId}/claims`, {
+    headers: { "Content-Type": "application/json" },
   });
   if (!res.ok) await handleErrorResponse(res);
   return res.json();

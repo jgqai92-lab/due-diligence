@@ -87,6 +87,22 @@ function ValidationBadge({ verdict }: { verdict: ValidationVerdict | null; }) {
   );
 }
 
+function SourceBadge({ claim }: { claim: ISTClaim }) {
+  const refreshNumber = claim.sourceRefreshNumber;
+  if (!claim.sourceRefreshId || !refreshNumber) {
+    return (
+      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-white/10 text-text-secondary">
+        Original
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-sky-500/10 text-sky-400">
+      Refresh #{refreshNumber}
+    </span>
+  );
+}
+
 // ─── Skeleton Row ───────────────────────────────────────────────────
 
 function SkeletonRow() {
@@ -94,6 +110,7 @@ function SkeletonRow() {
     <tr>
       <td className="px-3 py-3"><div className="h-4 w-6 bg-white/10 rounded animate-pulse" /></td>
       <td className="px-3 py-3"><div className="h-4 w-full bg-white/10 rounded animate-pulse" /></td>
+      <td className="px-3 py-3"><div className="h-4 w-20 bg-white/10 rounded animate-pulse" /></td>
       <td className="px-3 py-3"><div className="h-4 w-24 bg-white/10 rounded animate-pulse" /></td>
       <td className="px-3 py-3"><div className="h-4 w-16 bg-white/10 rounded animate-pulse" /></td>
       <td className="px-3 py-3"><div className="h-4 w-16 bg-white/10 rounded animate-pulse" /></td>
@@ -202,6 +219,7 @@ export default function ClaimsTable({ screenId }: ClaimsTableProps) {
               <tr className="border-b border-border">
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary w-10">#</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary">Claim</th>
+                <th className="px-3 py-3 text-xs font-medium text-text-secondary">Source</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary">Citation</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary">Quant Anchor</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary">Temporal</th>
@@ -239,6 +257,7 @@ export default function ClaimsTable({ screenId }: ClaimsTableProps) {
               <tr className="border-b border-border">
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary w-10" scope="col">#</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary min-w-[200px]" scope="col">Claim</th>
+                <th className="px-3 py-3 text-xs font-medium text-text-secondary" scope="col">Source</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary" scope="col">Citation</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary" scope="col">Quant Anchor</th>
                 <th className="px-3 py-3 text-xs font-medium text-text-secondary" scope="col">Temporal</th>
@@ -257,6 +276,9 @@ export default function ClaimsTable({ screenId }: ClaimsTableProps) {
                   </td>
                   <td className="px-3 py-3 text-xs text-text-primary leading-relaxed max-w-md">
                     {claim.claimText}
+                  </td>
+                  <td className="px-3 py-3 text-xs">
+                    <SourceBadge claim={claim} />
                   </td>
                   <td className="px-3 py-3 text-xs text-text-secondary max-w-[160px] truncate" title={claim.sourceCitation}>
                     {claim.sourceCitation}

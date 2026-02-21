@@ -43,8 +43,39 @@ const HFRT_PHASES: Record<number, PhaseConfig> = {
   5: { name: "Investment Thesis", textColor: "text-emerald-400", bgColor: "bg-emerald-500/10" },
 };
 
-function getPhases(workflowType: WorkflowType): Record<number, PhaseConfig> {
-  return workflowType === "IST" ? IST_PHASES : HFRT_PHASES;
+const IST_SYNTHESIS_PHASES: Record<number, PhaseConfig> = {
+  1: { name: "Screen Ingestion", textColor: "text-sky-400", bgColor: "bg-sky-500/10" },
+  2: { name: "Re-Analysis", textColor: "text-violet-400", bgColor: "bg-violet-500/10" },
+  3: { name: "Synthesis", textColor: "text-emerald-400", bgColor: "bg-emerald-500/10" },
+};
+
+const IST_REFRESH_PHASES: Record<number, PhaseConfig> = {
+  1: { name: "Delta Extraction", textColor: "text-sky-400", bgColor: "bg-sky-500/10" },
+  2: { name: "Re-Analysis", textColor: "text-violet-400", bgColor: "bg-violet-500/10" },
+  3: { name: "Re-Synthesis", textColor: "text-emerald-400", bgColor: "bg-emerald-500/10" },
+};
+
+function derivePhasesFromSteps(steps: WorkflowStep[]): Record<number, PhaseConfig> {
+  const derived: Record<number, PhaseConfig> = {};
+  for (const step of steps) {
+    if (!derived[step.phase]) {
+      derived[step.phase] = {
+        name: step.phaseName || `Phase ${step.phase}`,
+        textColor: "text-text-secondary",
+        bgColor: "bg-white/10",
+      };
+    }
+  }
+  return derived;
+}
+
+function getPhases(workflowType: WorkflowType, steps: WorkflowStep[]): Record<number, PhaseConfig> {
+  if (workflowType === "IST") return IST_PHASES;
+  if (workflowType === "HFRT") return HFRT_PHASES;
+  if (workflowType === "IST_SYNTHESIS") return IST_SYNTHESIS_PHASES;
+  if (workflowType === "IST_REFRESH") return IST_REFRESH_PHASES;
+  const derived = derivePhasesFromSteps(steps);
+  return Object.keys(derived).length ? derived : HFRT_PHASES;
 }
 
 // ─── Status Styling ─────────────────────────────────────────────────
@@ -101,7 +132,7 @@ export default function WorkflowProgressTracker({
   onRetry,
   onToggleAutoAdvance,
 }: WorkflowProgressTrackerProps) {
-  const phases = getPhases(workflowType);
+  const phases = getPhases(workflowType, steps);
   const phaseNumbers = Object.keys(phases).map(Number).sort((a, b) => a - b);
   const totalPhases = phaseNumbers.length;
 

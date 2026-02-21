@@ -111,6 +111,11 @@ function ScreenCard({
         </h3>
         <div className="flex items-center gap-2 flex-shrink-0">
           <StatusBadge status={screen.status} />
+          {screen.isRefreshing && (
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-sky-500/20 text-sky-400">
+              Refreshing
+            </span>
+          )}
           <ActionMenu items={menuItems} />
         </div>
       </div>
@@ -122,6 +127,9 @@ function ScreenCard({
         )}
         {screen.tier1Count > 0 && (
           <> &middot; {screen.tier1Count} Tier 1</>
+        )}
+        {screen.refreshCount > 0 && (
+          <> &middot; {screen.refreshCount} refresh{screen.refreshCount > 1 ? "es" : ""}</>
         )}
       </p>
 
@@ -207,14 +215,22 @@ export default function ScreensListPage() {
             Create and manage IST content screening workflows
           </p>
         </div>
-        <button
-          onClick={() => router.push("/screens/new")}
-          className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-[#050810] bg-primary rounded-lg hover:bg-primary-hover active:bg-primary-active hover:-translate-y-0.5 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 shadow-sm"
-          aria-label="Create new screen"
-        >
-          <Plus size={16} />
-          New Screen
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => router.push("/screens/syntheses")}
+            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-text-primary bg-white/10 border border-border rounded-lg hover:bg-white/15"
+          >
+            Syntheses
+          </button>
+          <button
+            onClick={() => router.push("/screens/new")}
+            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-[#050810] bg-primary rounded-lg hover:bg-primary-hover active:bg-primary-active hover:-translate-y-0.5 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 shadow-sm"
+            aria-label="Create new screen"
+          >
+            <Plus size={16} />
+            New Screen
+          </button>
+        </div>
       </div>
 
       {/* Error state */}

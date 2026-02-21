@@ -4,17 +4,26 @@ import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
-import { getScreen, updateScreenBrief, deleteScreen, getScreenInputs, rerunScreen } from "@/lib/api/ist";
+import {
+  getScreen,
+  updateScreenBrief,
+  deleteScreen,
+  getScreenInputs,
+  rerunScreen,
+  createScreenRefresh,
+  listScreenRefreshes,
+  getScreenRefresh,
+  getScreenRefreshClaims,
+} from "@/lib/api/ist";
 import { getWorkflow, advanceWorkflow, pauseWorkflow, cancelWorkflow, retryWorkflow, toggleAutoAdvance } from "@/lib/api/workflows";
 import { useWorkflowSSE } from "@/hooks/useWorkflowSSE";
 import WorkflowProgressTracker from "@/components/workflow/WorkflowProgressTracker";
 import ClaimsTable from "@/components/ist/ClaimsTable";
 import ScreeningBriefEditor from "@/components/ist/ScreeningBriefEditor";
-import type { ISTScreenDetail, ISTScreenStatus } from "@/types/ist";
+import type { ISTClaim, ISTRefreshDetail, ISTRefreshListItem, ISTScreenDetail, ISTScreenStatus } from "@/types/ist";
 import type { WorkflowDetail, WorkflowStatus, WorkflowStep } from "@/types/workflow";
-import { ArrowLeft, Loader2, AlertCircle, FileText, BarChart3, Target, Map, TrendingUp, Scale, FileCheck, CheckCircle, GitBranch, ShieldCheck, Trophy, RefreshCw, Calendar, Zap, Trash2, Eye, ChevronDown, ChevronUp } from "lucide-react";
+import { ArrowLeft, Loader2, AlertCircle, FileText, BarChart3, Target, Map, TrendingUp, Scale, FileCheck, CheckCircle, GitBranch, ShieldCheck, Trophy, RefreshCw, Calendar, Zap, Trash2, Eye, ChevronUp } from "lucide-react";
 import ActionMenu from "@/components/ActionMenu";
-import type { ActionMenuItem } from "@/components/ActionMenu";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import BottleneckMap from "@/components/ist/BottleneckMap";
 import DemandModels from "@/components/ist/DemandModels";
@@ -31,6 +40,9 @@ import CatalystCalendar from "@/components/ist/CatalystCalendar";
 import StressTests from "@/components/ist/StressTests";
 import FrameworksPanel from "@/components/ist/FrameworksPanel";
 import HandoffPanel from "@/components/ist/HandoffPanel";
+import RefreshModal from "@/components/ist/RefreshModal";
+import RefreshHistory from "@/components/ist/RefreshHistory";
+import RefreshDelta from "@/components/ist/RefreshDelta";
 import PersonaLauncher from "@/components/persona/PersonaLauncher";
 import PersonaHistory from "@/components/persona/PersonaHistory";
 
@@ -88,7 +100,16 @@ export default function ScreenDetailPage() {
   // Action state
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showRerunConfirm, setShowRerunConfirm] = useState(false);
+  const [showRefreshModal, setShowRefreshModal] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
+  const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
+  const [refreshModalError, setRefreshModalError] = useState<string | null>(null);
+  const [refreshes, setRefreshes] = useState<ISTRefreshListItem[]>([]);
+  const [selectedRefreshId, setSelectedRefreshId] = useState<number | null>(null);
+  const [selectedRefresh, setSelectedRefresh] = useState<ISTRefreshDetail | null>(null);
+  const [selectedRefreshClaims, setSelectedRefreshClaims] = useState<ISTClaim[]>([]);
+  const [refreshDetailLoading, setRefreshDetailLoading] = useState(false);
+  const [refreshDetailError, setRefreshDetailError] = useState<string | null>(null);
 
   // Original Inputs state
   const [showInputs, setShowInputs] = useState(false);
@@ -99,13 +120,14 @@ export default function ScreenDetailPage() {
   const [mainTab, setMainTab] = useState<MainTab>("working-data");
   const [workingDataTab, setWorkingDataTab] = useState<WorkingDataTab>("claims");
   const [hasAutoSwitched, setHasAutoSwitched] = useState(false);
+  const activeWorkflowRunId = screen?.activeWorkflowRunId ?? screen?.workflowRunId ?? null;
 
   // SSE connection for real-time workflow updates
   const {
     workflowStatus: sseStatus,
     steps: sseSteps,
   } = useWorkflowSSE({
-    workflowId: screen?.workflowRunId ?? null,
+    workflowId: activeWorkflowRunId,
     onWorkflowComplete: () => refreshScreen(),
     onCheckpoint: () => refreshScreen(),
   });
@@ -141,9 +163,18 @@ export default function ScreenDetailPage() {
     try {
       const screenData = await getScreen(screenId);
       setScreen(screenData);
+      const refreshData = await listScreenRefreshes(screenId).catch(() => null);
+      const nextRefreshes = refreshData?.refreshes ?? [];
+      setRefreshes(nextRefreshes);
+      setSelectedRefreshId((prev) => {
+        if (!nextRefreshes.length) return null;
+        if (prev && nextRefreshes.some((item) => item.id === prev)) return prev;
+        return nextRefreshes[0].id;
+      });
 
-      if (screenData.workflowRunId) {
-        const workflowData = await getWorkflow(screenData.workflowRunId);
+      const runId = screenData.activeWorkflowRunId ?? screenData.workflowRunId;
+      if (runId) {
+        const workflowData = await getWorkflow(runId);
         setWorkflow(workflowData);
       }
     } catch (err) {
@@ -157,8 +188,17 @@ export default function ScreenDetailPage() {
     try {
       const screenData = await getScreen(screenId);
       setScreen(screenData);
-      if (screenData.workflowRunId) {
-        const workflowData = await getWorkflow(screenData.workflowRunId);
+      const refreshData = await listScreenRefreshes(screenId).catch(() => null);
+      const nextRefreshes = refreshData?.refreshes ?? [];
+      setRefreshes(nextRefreshes);
+      setSelectedRefreshId((prev) => {
+        if (!nextRefreshes.length) return null;
+        if (prev && nextRefreshes.some((item) => item.id === prev)) return prev;
+        return nextRefreshes[0].id;
+      });
+      const runId = screenData.activeWorkflowRunId ?? screenData.workflowRunId;
+      if (runId) {
+        const workflowData = await getWorkflow(runId);
         setWorkflow(workflowData);
       }
     } catch {
@@ -169,6 +209,42 @@ export default function ScreenDetailPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  useEffect(() => {
+    if (!selectedRefreshId) {
+      setSelectedRefresh(null);
+      setSelectedRefreshClaims([]);
+      setRefreshDetailError(null);
+      setRefreshDetailLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setRefreshDetailLoading(true);
+    setRefreshDetailError(null);
+
+    Promise.all([
+      getScreenRefresh(screenId, selectedRefreshId),
+      getScreenRefreshClaims(screenId, selectedRefreshId),
+    ])
+      .then(([detail, claims]) => {
+        if (cancelled) return;
+        setSelectedRefresh(detail);
+        setSelectedRefreshClaims(claims.claims ?? []);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setRefreshDetailError(err instanceof Error ? err.message : "Failed to load refresh detail.");
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setRefreshDetailLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [screenId, selectedRefreshId]);
 
   // Auto-switch to Report tab when screen is COMPLETED (on first load)
   useEffect(() => {
@@ -182,55 +258,55 @@ export default function ScreenDetailPage() {
 
   // Workflow control handlers
   const handleAdvance = useCallback(async () => {
-    if (!screen?.workflowRunId) return;
+    if (!activeWorkflowRunId) return;
     try {
-      await advanceWorkflow(screen.workflowRunId);
+      await advanceWorkflow(activeWorkflowRunId);
       await refreshScreen();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to advance workflow");
     }
-  }, [screen?.workflowRunId, refreshScreen]);
+  }, [activeWorkflowRunId, refreshScreen]);
 
   const handlePause = useCallback(async () => {
-    if (!screen?.workflowRunId) return;
+    if (!activeWorkflowRunId) return;
     try {
-      await pauseWorkflow(screen.workflowRunId);
+      await pauseWorkflow(activeWorkflowRunId);
       await refreshScreen();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to pause workflow");
     }
-  }, [screen?.workflowRunId, refreshScreen]);
+  }, [activeWorkflowRunId, refreshScreen]);
 
   const handleCancel = useCallback(async () => {
-    if (!screen?.workflowRunId) return;
+    if (!activeWorkflowRunId) return;
     try {
-      await cancelWorkflow(screen.workflowRunId);
+      await cancelWorkflow(activeWorkflowRunId);
       await refreshScreen();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to cancel workflow");
     }
-  }, [screen?.workflowRunId, refreshScreen]);
+  }, [activeWorkflowRunId, refreshScreen]);
 
   const handleRetry = useCallback(async () => {
-    if (!screen?.workflowRunId) return;
+    if (!activeWorkflowRunId) return;
     try {
-      await retryWorkflow(screen.workflowRunId);
+      await retryWorkflow(activeWorkflowRunId);
       await refreshScreen();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to retry workflow");
     }
-  }, [screen?.workflowRunId, refreshScreen]);
+  }, [activeWorkflowRunId, refreshScreen]);
 
   // Auto-advance toggle handler
   const handleToggleAutoAdvance = useCallback(async (enabled: boolean) => {
-    if (!screen?.workflowRunId) return;
+    if (!activeWorkflowRunId) return;
     try {
-      await toggleAutoAdvance(screen.workflowRunId, enabled);
+      await toggleAutoAdvance(activeWorkflowRunId, enabled);
       await refreshScreen();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to toggle auto-advance");
     }
-  }, [screen?.workflowRunId, refreshScreen]);
+  }, [activeWorkflowRunId, refreshScreen]);
 
   // Brief save handler
   const handleSaveBrief = useCallback(
@@ -274,6 +350,38 @@ export default function ScreenDetailPage() {
       setActionLoading(false);
     }
   }, [screenId, refreshScreen]);
+
+  const handleCreateRefresh = useCallback(async (payload: { content: string; contentType: string; autoAdvance: boolean }) => {
+    if (!screen || screen.status !== "COMPLETED" || !screen.isCertified) {
+      setError("Screen must be completed and certified before refresh.");
+      return;
+    }
+
+    setActionLoading(true);
+    setRefreshWarning(null);
+    setRefreshModalError(null);
+    try {
+      const idempotencyKey = typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `refresh-${screenId}-${Date.now()}`;
+      const result = await createScreenRefresh(screenId, {
+        content: payload.content,
+        contentType: payload.contentType,
+        autoAdvance: payload.autoAdvance,
+        idempotencyKey,
+      });
+      setShowRefreshModal(false);
+      if (result.warning) {
+        setRefreshWarning(result.warning);
+      }
+      await advanceWorkflow(result.workflowRunId);
+      await refreshScreen();
+    } catch (err) {
+      setRefreshModalError(err instanceof Error ? err.message : "Failed to start refresh");
+    } finally {
+      setActionLoading(false);
+    }
+  }, [screen, screenId, refreshScreen]);
 
   // Toggle Original Inputs (lazy-fetch on first open)
   const toggleInputs = useCallback(async () => {
@@ -382,6 +490,15 @@ export default function ScreenDetailPage() {
           <ActionMenu
             items={[
               { label: "View Original Inputs", icon: Eye, onClick: toggleInputs },
+              {
+                label: "Refresh",
+                icon: RefreshCw,
+                onClick: () => {
+                  setRefreshModalError(null);
+                  setShowRefreshModal(true);
+                },
+                disabled: !screen.isCertified || screen.status !== "COMPLETED" || actionLoading,
+              },
               { label: "Rerun", icon: RefreshCw, onClick: () => setShowRerunConfirm(true), disabled: !["COMPLETED", "FAILED", "PENDING"].includes(screen.status) },
               { label: "Delete", icon: Trash2, onClick: () => setShowDeleteConfirm(true), variant: "danger" },
             ]}
@@ -397,11 +514,25 @@ export default function ScreenDetailPage() {
         </div>
       )}
 
+      {refreshWarning && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl px-5 py-3">
+          <p className="text-xs text-amber-300">{refreshWarning}</p>
+        </div>
+      )}
+
+      {screen.isRefreshing && (
+        <div className="bg-sky-500/10 border border-sky-500/30 rounded-xl px-5 py-3">
+          <p className="text-xs text-sky-300">
+            Refresh in progress on workflow run {screen.activeWorkflowRunId}.
+          </p>
+        </div>
+      )}
+
       {/* Workflow Progress Tracker */}
       {workflow && (
         <WorkflowProgressTracker
           workflowId={workflow.id}
-          workflowType="IST"
+          workflowType={workflow.workflowType}
           steps={effectiveSteps}
           status={effectiveStatus}
           currentPhase={effectivePhase}
@@ -616,6 +747,20 @@ export default function ScreenDetailPage() {
         <HandoffPanel screenId={screenId} isCertified={screen.isCertified} />
       )}
 
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <RefreshHistory
+          refreshes={refreshes}
+          selectedRefreshId={selectedRefreshId}
+          onSelectRefresh={setSelectedRefreshId}
+        />
+        <RefreshDelta
+          detail={selectedRefresh}
+          claims={selectedRefreshClaims}
+          loading={refreshDetailLoading}
+          error={refreshDetailError}
+        />
+      </div>
+
       {/* Original Inputs (collapsible) */}
       {showInputs && (
         <div className="bg-[rgba(10,15,26,0.6)] backdrop-blur-[12px] border border-border rounded-xl p-5 space-y-3 animate-in">
@@ -675,6 +820,19 @@ export default function ScreenDetailPage() {
 
       {/* Frameworks Reference Panel (floating button + slide-out drawer) */}
       <FrameworksPanel />
+
+      <RefreshModal
+        open={showRefreshModal}
+        loading={actionLoading}
+        defaultContentType={screen.contentType}
+        refreshCount={screen.refreshCount}
+        error={refreshModalError}
+        onClose={() => {
+          setRefreshModalError(null);
+          setShowRefreshModal(false);
+        }}
+        onSubmit={handleCreateRefresh}
+      />
 
       {/* Delete Confirmation */}
       <ConfirmDialog
