@@ -33,7 +33,7 @@ test_application/
 
 1. **Navigate to this directory:**
    ```bash
-   cd "C:/Users/jquez/Cursor Applications/test_application"
+   cd "C:/AI Workspace/test_application"
    ```
 
 2. **Start Claude Code:**
