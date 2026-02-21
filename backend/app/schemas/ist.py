@@ -6,7 +6,8 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-# ── Internal JSON-column validation models (INV-BE-06) ──────────────────────
+# Internal JSON-column validation models
+
 
 class ScreeningBrief(BaseModel):
     """Validated schema for ist_screens.screening_brief JSON column."""
@@ -36,7 +37,8 @@ class SourceBiasSummary(BaseModel):
     potentialBlindSpots: list[str] = Field(default_factory=list)
 
 
-# ── Request schemas ──────────────────────────────────────────────────────────
+# Request schemas
+
 
 class ISTScreenCreate(BaseModel):
     """Request body for creating a new IST screen."""
@@ -49,7 +51,7 @@ class ISTScreenCreate(BaseModel):
     content: str = Field(
         ...,
         min_length=100,
-        max_length=512000,  # 500 KB approx limit (INV-SE-03)
+        max_length=512000,
         description="Full content text to analyze",
     )
     content_type: Optional[str] = Field(
@@ -64,7 +66,7 @@ class ISTScreenCreate(BaseModel):
     )
     constraints: Optional[dict[str, Any]] = Field(
         default=None,
-        description="Optional screening constraints (e.g., minMarketCap, excludeSectors)",
+        description="Optional screening constraints",
     )
     frameworks: Optional[list[str]] = Field(
         default=None,
@@ -73,7 +75,7 @@ class ISTScreenCreate(BaseModel):
     auto_advance: bool = Field(
         default=False,
         alias="autoAdvance",
-        description="If true, workflow advances between phases automatically without user approval",
+        description="If true, workflow advances between phases automatically",
     )
 
     model_config = ConfigDict(populate_by_name=True)
@@ -123,17 +125,64 @@ class ISTScreenBriefUpdate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-# ── Response schemas ─────────────────────────────────────────────────────────
+class ISTSynthesisCreate(BaseModel):
+    """Request body for creating a cross-screen synthesis."""
+
+    name: str = Field(..., max_length=200)
+    screen_ids: list[int] = Field(
+        ...,
+        alias="screenIds",
+        min_length=2,
+        max_length=10,
+    )
+    auto_advance: bool = Field(default=False, alias="autoAdvance")
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        alias="idempotencyKey",
+        max_length=64,
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ISTScreenRefreshCreate(BaseModel):
+    """Request body for refreshing an existing completed IST screen."""
+
+    content: str = Field(
+        ...,
+        min_length=100,
+        max_length=512000,
+        description="New content delta to merge into the existing screen context",
+    )
+    content_type: Optional[str] = Field(
+        default="text",
+        alias="contentType",
+        description="Content type for the delta input",
+    )
+    auto_advance: bool = Field(default=False, alias="autoAdvance")
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        alias="idempotencyKey",
+        max_length=64,
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# Response schemas
+
 
 class ISTScreenResponse(BaseModel):
     """Response schema for screen creation."""
 
     id: int
     workflow_run_id: int = Field(alias="workflowRunId")
+    active_workflow_run_id: Optional[int] = Field(default=None, alias="activeWorkflowRunId")
     name: str
     status: str
     content_type: str = Field(alias="contentType")
     hypothesis: Optional[str] = None
+    refresh_count: int = Field(default=0, alias="refreshCount")
     created_at: datetime = Field(alias="createdAt")
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
@@ -146,9 +195,11 @@ class ISTScreenListItem(BaseModel):
     name: str
     status: str
     workflow_run_id: int = Field(alias="workflowRunId")
+    active_workflow_run_id: Optional[int] = Field(default=None, alias="activeWorkflowRunId")
     claim_count: int = Field(default=0, alias="claimCount")
     candidate_count: int = Field(default=0, alias="candidateCount")
     tier1_count: int = Field(default=0, alias="tier1Count")
+    refresh_count: int = Field(default=0, alias="refreshCount")
     current_phase: int = Field(default=0, alias="currentPhase")
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(alias="updatedAt")
@@ -168,6 +219,7 @@ class ISTScreenDetailResponse(BaseModel):
 
     id: int
     workflow_run_id: int = Field(alias="workflowRunId")
+    active_workflow_run_id: Optional[int] = Field(default=None, alias="activeWorkflowRunId")
     name: str
     status: str
     content_type: str = Field(alias="contentType")
@@ -180,6 +232,7 @@ class ISTScreenDetailResponse(BaseModel):
     source_bias: Optional[dict[str, Any]] = Field(
         default=None, alias="sourceBias"
     )
+    refresh_count: int = Field(default=0, alias="refreshCount")
     current_phase: int = Field(default=0, alias="currentPhase")
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(alias="updatedAt")

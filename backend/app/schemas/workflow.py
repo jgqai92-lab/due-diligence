@@ -14,7 +14,7 @@ class WorkflowCreate(BaseModel):
     workflow_type: str = Field(
         ...,
         alias="workflowType",
-        description="Workflow type: IST or HFRT",
+        description="Workflow type: IST, HFRT, IST_SYNTHESIS, or IST_REFRESH",
     )
     name: str = Field(
         ...,
@@ -31,7 +31,7 @@ class WorkflowCreate(BaseModel):
     @field_validator("workflow_type")
     @classmethod
     def validate_workflow_type(cls, v: str) -> str:
-        allowed = ("IST", "HFRT")
+        allowed = ("IST", "HFRT", "IST_SYNTHESIS", "IST_REFRESH")
         if v not in allowed:
             raise ValueError(f"workflow_type must be one of {allowed}")
         return v

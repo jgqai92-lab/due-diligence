@@ -34,6 +34,11 @@ class ISTScreen(Base):
         ForeignKey("workflow_runs.id", ondelete="CASCADE"),
         nullable=False,
     )
+    active_workflow_run_id = Column(
+        Integer,
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     name = Column(Text, nullable=False)
     status = Column(Text, nullable=False, default="PENDING")
     content_type = Column(Text, nullable=False, default="text")
@@ -45,6 +50,8 @@ class ISTScreen(Base):
     certified_at = Column(DateTime, nullable=True)
     certification = Column(Text, nullable=True)  # JSON: certification gate results
     hfrt_handoff = Column(Text, nullable=True)  # JSON: Tier 1 candidates for HFRT bridge
+    refresh_count = Column(Integer, nullable=False, default=0)
+    last_refreshed_at = Column(DateTime, nullable=True)
     created_at = Column(
         DateTime, nullable=False, default=lambda: datetime.now(timezone.utc)
     )
@@ -56,7 +63,21 @@ class ISTScreen(Base):
     )
 
     # Relationships
-    workflow_run = relationship("WorkflowRun", backref="ist_screen")
+    workflow_run = relationship(
+        "WorkflowRun",
+        foreign_keys=[workflow_run_id],
+        backref="ist_screen",
+    )
+    active_workflow_run = relationship(
+        "WorkflowRun",
+        foreign_keys=[active_workflow_run_id],
+    )
+    refreshes = relationship(
+        "ISTScreenRefresh",
+        back_populates="screen",
+        cascade="all, delete-orphan",
+        order_by="ISTScreenRefresh.refresh_number",
+    )
     claims = relationship(
         "ISTClaim",
         back_populates="screen",
@@ -137,6 +158,7 @@ class ISTScreen(Base):
             name="ck_ist_screen_content_type",
         ),
         Index("ix_ist_screens_workflow", "workflow_run_id"),
+        Index("ix_ist_screens_active_workflow", "active_workflow_run_id"),
         Index("ix_ist_screens_status", "status", "created_at"),
         Index("ix_ist_screens_created", "created_at"),
     )
@@ -162,6 +184,11 @@ class ISTClaim(Base):
     is_validated = Column(Integer, nullable=False, default=0)
     validation_verdict = Column(Text, nullable=True)
     validation_source = Column(Text, nullable=True)
+    source_refresh_id = Column(
+        Integer,
+        ForeignKey("ist_screen_refreshes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(
         DateTime, nullable=False, default=lambda: datetime.now(timezone.utc)
     )
@@ -174,6 +201,7 @@ class ISTClaim(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    source_refresh = relationship("ISTScreenRefresh", back_populates="claims")
 
     __table_args__ = (
         CheckConstraint(
@@ -186,6 +214,7 @@ class ISTClaim(Base):
             name="ck_ist_claim_validation_verdict",
         ),
         Index("ix_ist_claims_screen", "screen_id"),
+        Index("ix_ist_claims_refresh", "screen_id", "source_refresh_id"),
         Index("ix_ist_claims_bottleneck", "screen_id", "bottleneck_name"),
         Index("ix_ist_claims_validated", "screen_id", "is_validated"),
     )

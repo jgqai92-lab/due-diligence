@@ -27,6 +27,13 @@ from app.models.ist import (  # noqa: E402, F401
     ISTStressTest,
     ISTReport,
 )
+from app.models.ist_synthesis import (  # noqa: E402, F401
+    ISTSynthesis,
+    ISTSynthesisSource,
+    ISTSynthesisEquity,
+    ISTSynthesisDialectic,
+)
+from app.models.ist_refresh import ISTScreenRefresh  # noqa: E402, F401
 from app.models.hfrt import (  # noqa: E402, F401
     HFRTProject,
     HFRTTemplate,

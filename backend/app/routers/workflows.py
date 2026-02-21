@@ -100,7 +100,9 @@ def _build_detail_response(run: WorkflowRun) -> dict:
 @router.get("")
 def list_workflows(
     workflow_type: Optional[str] = Query(
-        default=None, alias="workflowType", description="Filter by type: IST or HFRT"
+        default=None,
+        alias="workflowType",
+        description="Filter by type: IST, HFRT, IST_SYNTHESIS, or IST_REFRESH",
     ),
     status: Optional[str] = Query(
         default=None, description="Filter by status"
@@ -113,12 +115,13 @@ def list_workflows(
     query = db.query(WorkflowRun)
 
     if workflow_type:
-        if workflow_type not in ("IST", "HFRT"):
+        allowed_types = ("IST", "HFRT", "IST_SYNTHESIS", "IST_REFRESH")
+        if workflow_type not in allowed_types:
             raise HTTPException(
                 status_code=400,
                 detail=_error(
                     "INVALID_FILTER",
-                    "workflowType must be IST or HFRT",
+                    f"workflowType must be one of {allowed_types}",
                 ),
             )
         query = query.filter(WorkflowRun.workflow_type == workflow_type)

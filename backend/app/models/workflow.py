@@ -50,7 +50,7 @@ class WorkflowRun(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "workflow_type IN ('IST', 'HFRT')",
+            "workflow_type IN ('IST', 'HFRT', 'IST_SYNTHESIS', 'IST_REFRESH')",
             name="ck_workflow_type",
         ),
         CheckConstraint(
