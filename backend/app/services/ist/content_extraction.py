@@ -1,76 +1,47 @@
-"""IST Phase 1: Content Extraction -- parses unstructured text into structured claims.
-
-Provides two registered workflow steps:
-  - content_extraction: Extract discrete, verifiable claims from source content
-  - source_bias_assessment: Assess source bias and credibility
-
-Invariants enforced:
-  - INV-AI-01: Content/instruction separation (user data in XML tags)
-  - INV-AI-03: Pydantic-validated Claude outputs
-  - INV-AI-04: Anti-hallucination instruction in system prompts
-  - INV-BE-05: Background tasks own their DB sessions
-  - INV-BE-06: JSON stored via Pydantic serialization
-  - INV-AC-03: Per-step session lifecycle (open -> write -> commit -> close)
-"""
+"""IST Phase 1: Content extraction and source bias assessment."""
 
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.models.ist import ISTScreen, ISTClaim
+from app.models.ist import ISTClaim, ISTScreen
 from app.schemas.ist import ContentExtractionSummary, SourceBiasSummary
 from app.services.ist.claude_client import call_claude
-from app.services.workflow_engine import register_step, emit_sse_event
+from app.services.workflow_engine import emit_sse_event, register_step
 
 logger = logging.getLogger(__name__)
 
 
-# ── Pydantic models for Claude structured output (INV-AI-03) ────────────────
-
-
 class ExtractedClaim(BaseModel):
-    """A single claim extracted from source content."""
+    """A single extracted claim."""
 
     claim_text: str = Field(description="The discrete, verifiable claim")
-    source_citation: str = Field(
-        description="Where in the source this came from"
-    )
-    quantitative_anchor: Optional[str] = Field(
-        default=None, description="Numeric data point"
-    )
-    temporal_marker: Optional[str] = Field(
-        default=None, description="Time reference"
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0, description="Extraction confidence 0-1"
-    )
+    source_citation: str = Field(description="Where in the source this came from")
+    quantitative_anchor: Optional[str] = Field(default=None)
+    temporal_marker: Optional[str] = Field(default=None)
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
 class ContentExtractionResult(BaseModel):
-    """Structured output from the content extraction Claude call."""
+    """Structured extraction output."""
 
     claims: list[ExtractedClaim]
-    summary: str = Field(description="Brief summary of the content")
-    content_themes: list[str] = Field(description="Major themes identified")
+    summary: str
+    content_themes: list[str]
 
 
 class SourceBiasResult(BaseModel):
-    """Structured output from the source bias assessment Claude call."""
+    """Structured source-bias output."""
 
-    rating: str = Field(description="Overall bias rating: low, moderate, high")
-    notes: str = Field(description="Bias assessment narrative")
-    source_credibility: str = Field(
-        description="Source credibility assessment"
-    )
-    potential_blind_spots: list[str] = Field(
-        description="Areas the source may underweight"
-    )
+    rating: str
+    notes: str
+    source_credibility: str
+    potential_blind_spots: list[str]
 
-
-# ── System prompts (INV-AI-04: anti-hallucination instructions) ─────────────
 
 EXTRACTION_SYSTEM_PROMPT = """You are an investment research analyst extracting structured claims from unstructured content.
 
@@ -102,125 +73,151 @@ NEVER fabricate claims about the source. Base your assessment only on the conten
 Return ONLY valid JSON matching the schema provided."""
 
 
-# ── Registered workflow step handlers ───────────────────────────────────────
-
-
-@register_step("IST", "content_extraction")
-async def handle_content_extraction(workflow_run_id: int) -> dict | None:
-    """Extract claims from raw content and store them in the database.
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via Pydantic serialization.
-    """
-    db = SessionLocal()
-    try:
-        # Find the IST screen linked to this workflow
-        screen = (
-            db.query(ISTScreen)
-            .filter(ISTScreen.workflow_run_id == workflow_run_id)
-            .first()
-        )
-        if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        # Update screen status
+async def _run_content_extraction(
+    screen: ISTScreen,
+    db: Session,
+    workflow_run_id: int,
+    *,
+    raw_content: Optional[str] = None,
+    claim_source_refresh_id: Optional[int] = None,
+    update_screen_status: bool = True,
+    replace_claims: bool = False,
+) -> dict | None:
+    """Core extraction logic reusable by IST and IST_REFRESH wrappers."""
+    if update_screen_status:
         screen.status = "EXTRACTING"
         screen.updated_at = datetime.now(timezone.utc)
         db.commit()
 
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "content_extraction",
-                "message": "Extracting claims from content...",
-                "percent": 10,
-            },
-        )
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "content_extraction",
+            "message": "Extracting claims from content...",
+            "percent": 10,
+        },
+    )
 
-        # Build user prompt with content/instruction separation (INV-AI-01)
-        brief_data = {}
-        if screen.screening_brief:
-            import json
+    brief_data: dict = {}
+    if screen.screening_brief:
+        import json
 
-            try:
-                brief_data = json.loads(screen.screening_brief)
-            except (ValueError, TypeError):
-                pass
+        try:
+            brief_data = json.loads(screen.screening_brief)
+        except (ValueError, TypeError):
+            brief_data = {}
 
-        user_prompt = (
-            f"<source_content>\n{screen.raw_content}\n</source_content>\n\n"
-            f"<metadata>\n"
-            f"Content type: {screen.content_type}\n"
-            f"Hypothesis: {brief_data.get('hypothesis', 'Not specified')}\n"
-            f"</metadata>\n\n"
-            f"Extract all investment-relevant claims from the content above.\n"
-            f"Return JSON matching this schema: "
-            f"{ContentExtractionResult.model_json_schema()}"
-        )
+    source_content = raw_content if raw_content is not None else screen.raw_content
 
-        # Call Claude for extraction (INV-AI-03: validated via Pydantic)
-        result = await call_claude(
-            system_prompt=EXTRACTION_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=ContentExtractionResult,
-        )
+    user_prompt = (
+        f"<source_content>\n{source_content}\n</source_content>\n\n"
+        f"<metadata>\n"
+        f"Content type: {screen.content_type}\n"
+        f"Hypothesis: {brief_data.get('hypothesis', 'Not specified')}\n"
+        f"</metadata>\n\n"
+        f"Extract all investment-relevant claims from the content above.\n"
+        f"Return JSON matching this schema: "
+        f"{ContentExtractionResult.model_json_schema()}"
+    )
 
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "content_extraction",
-                "message": f"Extracted {len(result.claims)} claims, storing...",
-                "percent": 70,
-            },
-        )
+    result = await call_claude(
+        system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_model=ContentExtractionResult,
+    )
 
-        # Store claims in database (INV-BE-01: ORM writes only)
-        for claim_data in result.claims:
-            claim = ISTClaim(
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "content_extraction",
+            "message": f"Extracted {len(result.claims)} claims, storing...",
+            "percent": 70,
+        },
+    )
+
+    if replace_claims:
+        db.query(ISTClaim).filter(ISTClaim.screen_id == screen.id).delete()
+
+    for claim_data in result.claims:
+        db.add(
+            ISTClaim(
                 screen_id=screen.id,
                 claim_text=claim_data.claim_text,
                 source_citation=claim_data.source_citation,
                 quantitative_anchor=claim_data.quantitative_anchor,
                 temporal_marker=claim_data.temporal_marker,
                 confidence=claim_data.confidence,
+                source_refresh_id=claim_source_refresh_id,
             )
-            db.add(claim)
-
-        # Update screen content_extraction summary (INV-BE-06: Pydantic-validated JSON)
-        extraction_summary = ContentExtractionSummary(
-            totalClaims=len(result.claims),
-            claimsWithQuantAnchors=sum(
-                1 for c in result.claims if c.quantitative_anchor
-            ),
-            claimsWithTemporalMarkers=sum(
-                1 for c in result.claims if c.temporal_marker
-            ),
-            summary=result.summary,
-            themes=result.content_themes,
         )
-        screen.content_extraction = extraction_summary.model_dump_json()
-        screen.updated_at = datetime.now(timezone.utc)
-        db.commit()
 
-        return {
-            "claimsExtracted": len(result.claims),
-            "themes": result.content_themes,
-        }
-    finally:
-        db.close()
+    db.flush()
+    total_claims = db.query(ISTClaim).filter(ISTClaim.screen_id == screen.id).count()
+
+    extraction_summary = ContentExtractionSummary(
+        totalClaims=total_claims,
+        claimsWithQuantAnchors=sum(1 for c in result.claims if c.quantitative_anchor),
+        claimsWithTemporalMarkers=sum(1 for c in result.claims if c.temporal_marker),
+        summary=result.summary,
+        themes=result.content_themes,
+    )
+
+    screen.content_extraction = extraction_summary.model_dump_json()
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "claimsExtracted": len(result.claims),
+        "themes": result.content_themes,
+    }
 
 
-@register_step("IST", "source_bias_assessment")
-async def handle_source_bias(workflow_run_id: int) -> dict | None:
-    """Assess source bias and credibility.
+async def _run_source_bias(
+    screen: ISTScreen,
+    db: Session,
+    workflow_run_id: int,
+    *,
+    raw_content: Optional[str] = None,
+) -> dict | None:
+    """Core source-bias logic reusable by IST and IST_REFRESH wrappers."""
+    source_content = raw_content if raw_content is not None else screen.raw_content
+    content_sample = source_content[:5000]
 
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via Pydantic serialization.
-    """
+    user_prompt = (
+        f"<source_content>\n{content_sample}\n</source_content>\n\n"
+        f"<metadata>\n"
+        f"Content type: {screen.content_type}\n"
+        f"Full content length: {len(source_content)} characters\n"
+        f"</metadata>\n\n"
+        f"Assess the source bias and credibility of this content.\n"
+        f"Return JSON matching this schema: "
+        f"{SourceBiasResult.model_json_schema()}"
+    )
+
+    result = await call_claude(
+        system_prompt=SOURCE_BIAS_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_model=SourceBiasResult,
+    )
+
+    bias_summary = SourceBiasSummary(
+        rating=result.rating,
+        notes=result.notes,
+        sourceCredibility=result.source_credibility,
+        potentialBlindSpots=result.potential_blind_spots,
+    )
+    screen.source_bias = bias_summary.model_dump_json()
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {"biasRating": result.rating}
+
+
+@register_step("IST", "content_extraction")
+async def handle_content_extraction(workflow_run_id: int) -> dict | None:
+    """Extract claims from raw content and store them."""
     db = SessionLocal()
     try:
         screen = (
@@ -229,43 +226,26 @@ async def handle_source_bias(workflow_run_id: int) -> dict | None:
             .first()
         )
         if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
 
-        # Truncate content for bias assessment (first 5000 chars is enough)
-        content_sample = screen.raw_content[:5000]
+        return await _run_content_extraction(screen, db, workflow_run_id)
+    finally:
+        db.close()
 
-        # INV-AI-01: User data in XML tags, instructions in system prompt
-        user_prompt = (
-            f"<source_content>\n{content_sample}\n</source_content>\n\n"
-            f"<metadata>\n"
-            f"Content type: {screen.content_type}\n"
-            f"Full content length: {len(screen.raw_content)} characters\n"
-            f"</metadata>\n\n"
-            f"Assess the source bias and credibility of this content.\n"
-            f"Return JSON matching this schema: "
-            f"{SourceBiasResult.model_json_schema()}"
+
+@register_step("IST", "source_bias_assessment")
+async def handle_source_bias(workflow_run_id: int) -> dict | None:
+    """Assess source bias and credibility."""
+    db = SessionLocal()
+    try:
+        screen = (
+            db.query(ISTScreen)
+            .filter(ISTScreen.workflow_run_id == workflow_run_id)
+            .first()
         )
+        if not screen:
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
 
-        # INV-AI-03: Pydantic-validated structured output
-        result = await call_claude(
-            system_prompt=SOURCE_BIAS_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=SourceBiasResult,
-        )
-
-        # INV-BE-06: Write JSON via Pydantic serialization
-        bias_summary = SourceBiasSummary(
-            rating=result.rating,
-            notes=result.notes,
-            sourceCredibility=result.source_credibility,
-            potentialBlindSpots=result.potential_blind_spots,
-        )
-        screen.source_bias = bias_summary.model_dump_json()
-        screen.updated_at = datetime.now(timezone.utc)
-        db.commit()
-
-        return {"biasRating": result.rating}
+        return await _run_source_bias(screen, db, workflow_run_id)
     finally:
         db.close()

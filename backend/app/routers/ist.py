@@ -36,10 +36,12 @@ from app.models.ist import (
     ISTStressTest,
     ISTValidation,
 )
+from app.models.ist_refresh import ISTScreenRefresh
 from app.models.workflow import WorkflowRun, WorkflowStep
 from app.schemas.ist import (
     ISTClaimResponse,
     ISTClaimsListResponse,
+    ISTScreenRefreshCreate,
     ISTScreenBriefUpdate,
     ISTScreenCreate,
     ISTScreenDetailResponse,
@@ -48,6 +50,7 @@ from app.schemas.ist import (
     ISTScreenResponse,
     ScreeningBrief,
 )
+from app.services.ist.refresh import IST_REFRESH_WORKFLOW_STEPS
 
 logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
@@ -149,6 +152,7 @@ def create_screen(
     # 3. Create the ISTScreen
     screen = ISTScreen(
         workflow_run_id=run.id,
+        active_workflow_run_id=run.id,
         name=data.name,
         status="PENDING",
         content_type=data.content_type or "text",
@@ -181,10 +185,12 @@ def create_screen(
     return {
         "id": screen.id,
         "workflowRunId": run.id,
+        "activeWorkflowRunId": screen.active_workflow_run_id,
         "name": screen.name,
         "status": screen.status,
         "contentType": screen.content_type,
         "hypothesis": data.hypothesis,
+        "refreshCount": screen.refresh_count,
         "createdAt": screen.created_at.isoformat() if screen.created_at else None,
     }
 
@@ -216,6 +222,28 @@ async def delete_screen(screen_id: int, db: Session = Depends(get_db)):
             await cancel_workflow(run.id)
         except Exception:
             pass  # Best-effort cancel before delete
+
+    # Cancel and delete any refresh workflow runs tied to this screen.
+    refresh_run_ids = [
+        row.workflow_run_id
+        for row in db.query(ISTScreenRefresh.workflow_run_id)
+        .filter(ISTScreenRefresh.screen_id == screen_id)
+        .all()
+    ]
+    for refresh_run_id in refresh_run_ids:
+        refresh_run = (
+            db.query(WorkflowRun)
+            .filter(WorkflowRun.id == refresh_run_id)
+            .first()
+        )
+        if refresh_run and refresh_run.status in ("RUNNING", "PAUSED", "PENDING"):
+            try:
+                await cancel_workflow(refresh_run.id)
+            except Exception:
+                pass
+        if refresh_run:
+            db.query(WorkflowStep).filter(WorkflowStep.workflow_run_id == refresh_run.id).delete()
+            db.delete(refresh_run)
 
     # Delete workflow steps, then workflow run, then screen (CASCADE handles IST child tables)
     if run:
@@ -309,6 +337,28 @@ async def rerun_screen(screen_id: int, db: Session = Depends(get_db)):
             ),
         )
 
+    # Delete refresh workflow runs first to avoid orphans.
+    refresh_run_ids = [
+        row.workflow_run_id
+        for row in db.query(ISTScreenRefresh.workflow_run_id)
+        .filter(ISTScreenRefresh.screen_id == screen_id)
+        .all()
+    ]
+    for refresh_run_id in refresh_run_ids:
+        refresh_run = (
+            db.query(WorkflowRun)
+            .filter(WorkflowRun.id == refresh_run_id)
+            .first()
+        )
+        if refresh_run and refresh_run.status in ("RUNNING", "PAUSED", "PENDING"):
+            try:
+                await cancel_workflow(refresh_run.id)
+            except Exception:
+                pass
+        if refresh_run:
+            db.query(WorkflowStep).filter(WorkflowStep.workflow_run_id == refresh_run.id).delete()
+            db.delete(refresh_run)
+
     # Delete child records in dependency order
     db.query(ISTReport).filter(ISTReport.screen_id == screen_id).delete()
     db.query(ISTStressTest).filter(ISTStressTest.screen_id == screen_id).delete()
@@ -322,18 +372,22 @@ async def rerun_screen(screen_id: int, db: Session = Depends(get_db)):
     db.query(ISTDemandModel).filter(ISTDemandModel.screen_id == screen_id).delete()
     db.query(ISTBottleneck).filter(ISTBottleneck.screen_id == screen_id).delete()
     db.query(ISTClaim).filter(ISTClaim.screen_id == screen_id).delete()
+    db.query(ISTScreenRefresh).filter(ISTScreenRefresh.screen_id == screen_id).delete()
 
     # Delete old workflow steps
     db.query(WorkflowStep).filter(WorkflowStep.workflow_run_id == run.id).delete()
 
     # Reset screen
     screen.status = "PENDING"
+    screen.active_workflow_run_id = run.id
     screen.content_extraction = None
     screen.source_bias = None
     screen.is_certified = False
     screen.certified_at = None
     screen.certification = None
     screen.hfrt_handoff = None
+    screen.refresh_count = 0
+    screen.last_refreshed_at = None
     screen.updated_at = datetime.now(timezone.utc)
 
     # Reset workflow run
@@ -373,6 +427,331 @@ async def rerun_screen(screen_id: int, db: Session = Depends(get_db)):
 
 
 # ── GET /api/ist/screens — List IST Screens ────────────────────────────────
+
+
+@router.post("/screens/{screen_id}/refresh", status_code=201)
+async def create_screen_refresh(
+    screen_id: int,
+    data: ISTScreenRefreshCreate,
+    db: Session = Depends(get_db),
+):
+    """Create an IST refresh workflow run for a completed certified screen."""
+    screen = db.query(ISTScreen).filter(ISTScreen.id == screen_id).first()
+    if not screen:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("SCREEN_NOT_FOUND", f"No screen with id {screen_id}"),
+        )
+
+    if screen.status != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail=_error(
+                "INVALID_STATE",
+                f"Screen {screen_id} must be COMPLETED to refresh.",
+            ),
+        )
+
+    if not screen.is_certified:
+        raise HTTPException(
+            status_code=409,
+            detail=_error(
+                "NOT_CERTIFIED",
+                f"Screen {screen_id} must be certified before refresh.",
+            ),
+        )
+
+    active_count = (
+        db.query(WorkflowRun)
+        .filter(WorkflowRun.status.in_(["PENDING", "RUNNING", "PAUSED"]))
+        .count()
+    )
+    if active_count >= 10:
+        raise HTTPException(
+            status_code=429,
+            detail=_error(
+                "TOO_MANY_WORKFLOWS",
+                "Maximum of 10 active workflows reached. "
+                "Complete or cancel existing workflows first.",
+            ),
+        )
+
+    if data.idempotency_key:
+        existing = (
+            db.query(ISTScreenRefresh)
+            .filter(ISTScreenRefresh.idempotency_key == data.idempotency_key)
+            .filter(ISTScreenRefresh.status != "FAILED")
+            .first()
+        )
+        if existing:
+            warning = None
+            if int(screen.refresh_count or 0) >= 3:
+                warning = (
+                    "This screen has been refreshed 3+ times. "
+                    "Consider creating a fresh screen."
+                )
+            response = {
+                "id": existing.id,
+                "screenId": existing.screen_id,
+                "workflowRunId": existing.workflow_run_id,
+                "refreshNumber": existing.refresh_number,
+                "status": existing.status,
+                "createdAt": existing.created_at.isoformat() if existing.created_at else None,
+                "idempotent": True,
+            }
+            if warning:
+                response["warning"] = warning
+            return response
+
+    next_refresh_number_row = (
+        db.query(func.max(ISTScreenRefresh.refresh_number))
+        .filter(ISTScreenRefresh.screen_id == screen_id)
+        .scalar()
+    )
+    next_refresh_number = int(next_refresh_number_row or 0) + 1
+
+    run = WorkflowRun(
+        workflow_type="IST_REFRESH",
+        name=f"{screen.name} Refresh #{next_refresh_number}",
+        status="PENDING",
+        current_phase=0,
+        auto_advance=data.auto_advance,
+    )
+    db.add(run)
+    db.flush()
+
+    refresh = ISTScreenRefresh(
+        screen_id=screen.id,
+        workflow_run_id=run.id,
+        refresh_number=next_refresh_number,
+        status="PENDING",
+        content_type=data.content_type or "text",
+        delta_content=data.content,
+        idempotency_key=data.idempotency_key,
+    )
+    db.add(refresh)
+    db.flush()
+
+    for step_def in IST_REFRESH_WORKFLOW_STEPS:
+        db.add(
+            WorkflowStep(
+                workflow_run_id=run.id,
+                step_name=step_def["step_name"],
+                phase=step_def["phase"],
+                phase_name=step_def["phase_name"],
+                step_order=step_def["step_order"],
+                status="PENDING",
+                depends_on=json.dumps(step_def.get("depends_on", [])),
+                model_tier=step_def.get("model", "opus"),
+                retry_strategy=step_def.get("retry_strategy"),
+            )
+        )
+
+    screen.active_workflow_run_id = run.id
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(refresh)
+
+    warning = None
+    if int(screen.refresh_count or 0) >= 3:
+        warning = (
+            "This screen has been refreshed 3+ times. "
+            "Consider creating a fresh screen."
+        )
+
+    response = {
+        "id": refresh.id,
+        "screenId": screen.id,
+        "workflowRunId": run.id,
+        "refreshNumber": refresh.refresh_number,
+        "status": refresh.status,
+        "createdAt": refresh.created_at.isoformat() if refresh.created_at else None,
+    }
+    if warning:
+        response["warning"] = warning
+    return response
+
+
+@router.get("/screens/{screen_id}/refreshes")
+def list_screen_refreshes(screen_id: int, db: Session = Depends(get_db)):
+    """List all refresh operations for a screen."""
+    screen = db.query(ISTScreen).filter(ISTScreen.id == screen_id).first()
+    if not screen:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("SCREEN_NOT_FOUND", f"No screen with id {screen_id}"),
+        )
+
+    refreshes = (
+        db.query(ISTScreenRefresh)
+        .filter(ISTScreenRefresh.screen_id == screen_id)
+        .order_by(ISTScreenRefresh.refresh_number.desc())
+        .all()
+    )
+
+    refresh_ids = [r.id for r in refreshes]
+    delta_claim_counts = {}
+    if refresh_ids:
+        rows = (
+            db.query(
+                ISTClaim.source_refresh_id,
+                func.count(ISTClaim.id).label("cnt"),
+            )
+            .filter(ISTClaim.screen_id == screen_id)
+            .filter(ISTClaim.source_refresh_id.in_(refresh_ids))
+            .group_by(ISTClaim.source_refresh_id)
+            .all()
+        )
+        delta_claim_counts = {row.source_refresh_id: row.cnt for row in rows}
+
+    return {
+        "screenId": screen_id,
+        "refreshes": [
+            {
+                "id": refresh.id,
+                "workflowRunId": refresh.workflow_run_id,
+                "refreshNumber": refresh.refresh_number,
+                "status": refresh.status,
+                "contentType": refresh.content_type,
+                "deltaClaimCount": int(delta_claim_counts.get(refresh.id, 0)),
+                "stepsReexecuted": _deep_camel(_safe_json_parse(refresh.steps_reexecuted)),
+                "impactAssessment": _deep_camel(_safe_json_parse(refresh.impact_assessment)),
+                "errorMessage": refresh.error_message,
+                "isActive": (
+                    screen.active_workflow_run_id == refresh.workflow_run_id
+                ),
+                "startedAt": refresh.started_at.isoformat() if refresh.started_at else None,
+                "completedAt": refresh.completed_at.isoformat() if refresh.completed_at else None,
+                "createdAt": refresh.created_at.isoformat() if refresh.created_at else None,
+            }
+            for refresh in refreshes
+        ],
+        "total": len(refreshes),
+    }
+
+
+@router.get("/screens/{screen_id}/refreshes/{refresh_id}")
+def get_screen_refresh_detail(
+    screen_id: int,
+    refresh_id: int,
+    db: Session = Depends(get_db),
+):
+    """Get detailed metadata for a specific refresh operation."""
+    screen = db.query(ISTScreen).filter(ISTScreen.id == screen_id).first()
+    if not screen:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("SCREEN_NOT_FOUND", f"No screen with id {screen_id}"),
+        )
+
+    refresh = (
+        db.query(ISTScreenRefresh)
+        .filter(
+            ISTScreenRefresh.id == refresh_id,
+            ISTScreenRefresh.screen_id == screen_id,
+        )
+        .first()
+    )
+    if not refresh:
+        raise HTTPException(
+            status_code=404,
+            detail=_error(
+                "REFRESH_NOT_FOUND",
+                f"No refresh with id {refresh_id} for screen {screen_id}.",
+            ),
+        )
+
+    delta_claim_count = (
+        db.query(func.count(ISTClaim.id))
+        .filter(
+            ISTClaim.screen_id == screen_id,
+            ISTClaim.source_refresh_id == refresh_id,
+        )
+        .scalar()
+    )
+
+    return {
+        "id": refresh.id,
+        "screenId": screen_id,
+        "workflowRunId": refresh.workflow_run_id,
+        "refreshNumber": refresh.refresh_number,
+        "status": refresh.status,
+        "contentType": refresh.content_type,
+        "deltaContent": refresh.delta_content,
+        "deltaClaimCount": int(delta_claim_count or 0),
+        "stepsReexecuted": _deep_camel(_safe_json_parse(refresh.steps_reexecuted)),
+        "impactAssessment": _deep_camel(_safe_json_parse(refresh.impact_assessment)),
+        "refreshNotes": _deep_camel(_safe_json_parse(refresh.refresh_notes)),
+        "errorMessage": refresh.error_message,
+        "isActive": (screen.active_workflow_run_id == refresh.workflow_run_id),
+        "startedAt": refresh.started_at.isoformat() if refresh.started_at else None,
+        "completedAt": refresh.completed_at.isoformat() if refresh.completed_at else None,
+        "createdAt": refresh.created_at.isoformat() if refresh.created_at else None,
+    }
+
+
+@router.get("/screens/{screen_id}/refreshes/{refresh_id}/claims")
+def get_screen_refresh_claims(
+    screen_id: int,
+    refresh_id: int,
+    db: Session = Depends(get_db),
+):
+    """Get only the claims added during a specific refresh."""
+    screen = db.query(ISTScreen).filter(ISTScreen.id == screen_id).first()
+    if not screen:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("SCREEN_NOT_FOUND", f"No screen with id {screen_id}"),
+        )
+
+    refresh = (
+        db.query(ISTScreenRefresh)
+        .filter(
+            ISTScreenRefresh.id == refresh_id,
+            ISTScreenRefresh.screen_id == screen_id,
+        )
+        .first()
+    )
+    if not refresh:
+        raise HTTPException(
+            status_code=404,
+            detail=_error(
+                "REFRESH_NOT_FOUND",
+                f"No refresh with id {refresh_id} for screen {screen_id}.",
+            ),
+        )
+
+    claims = (
+        db.query(ISTClaim)
+        .filter(
+            ISTClaim.screen_id == screen_id,
+            ISTClaim.source_refresh_id == refresh_id,
+        )
+        .order_by(ISTClaim.id)
+        .all()
+    )
+
+    return {
+        "screenId": screen_id,
+        "refreshId": refresh_id,
+        "claims": [
+            {
+                "id": claim.id,
+                "claimText": claim.claim_text,
+                "sourceCitation": claim.source_citation,
+                "quantitativeAnchor": claim.quantitative_anchor,
+                "temporalMarker": claim.temporal_marker,
+                "bottleneckName": claim.bottleneck_name,
+                "confidence": claim.confidence,
+                "isValidated": bool(claim.is_validated),
+                "validationVerdict": claim.validation_verdict,
+                "validationSource": claim.validation_source,
+                "createdAt": claim.created_at.isoformat() if claim.created_at else None,
+            }
+            for claim in claims
+        ],
+        "totalCount": len(claims),
+    }
 
 
 @router.get("/screens")
@@ -462,7 +841,10 @@ def list_screens(
         tier1_counts = {row.screen_id: row.cnt for row in tier1_rows}
 
         # Current phase from workflow_runs
-        run_ids = [s.workflow_run_id for s in screens]
+        run_ids = [
+            (s.active_workflow_run_id or s.workflow_run_id)
+            for s in screens
+        ]
         phase_rows = (
             db.query(
                 WorkflowRun.id,
@@ -473,7 +855,8 @@ def list_screens(
         )
         run_phase_map = {row.id: row.current_phase for row in phase_rows}
         phase_map = {
-            s.id: run_phase_map.get(s.workflow_run_id, 0) for s in screens
+            s.id: run_phase_map.get((s.active_workflow_run_id or s.workflow_run_id), 0)
+            for s in screens
         }
 
     items = []
@@ -483,9 +866,18 @@ def list_screens(
             "name": s.name,
             "status": s.status,
             "workflowRunId": s.workflow_run_id,
+            "activeWorkflowRunId": s.active_workflow_run_id or s.workflow_run_id,
             "claimCount": claim_counts.get(s.id, 0),
             "candidateCount": candidate_counts.get(s.id, 0),
             "tier1Count": tier1_counts.get(s.id, 0),
+            "refreshCount": int(s.refresh_count or 0),
+            "isRefreshing": (
+                (s.active_workflow_run_id is not None)
+                and (s.active_workflow_run_id != s.workflow_run_id)
+            ),
+            "lastRefreshedAt": (
+                s.last_refreshed_at.isoformat() if s.last_refreshed_at else None
+            ),
             "currentPhase": phase_map.get(s.id, 0),
             "createdAt": s.created_at.isoformat() if s.created_at else None,
             "updatedAt": s.updated_at.isoformat() if s.updated_at else None,
@@ -507,10 +899,12 @@ def get_screen_detail(screen_id: int, db: Session = Depends(get_db)):
             detail=_error("SCREEN_NOT_FOUND", f"No screen with id {screen_id}"),
         )
 
-    # Get current phase from workflow run
+    active_run_id = screen.active_workflow_run_id or screen.workflow_run_id
+
+    # Get current phase from active workflow run
     run = (
         db.query(WorkflowRun)
-        .filter(WorkflowRun.id == screen.workflow_run_id)
+        .filter(WorkflowRun.id == active_run_id)
         .first()
     )
     current_phase = run.current_phase if run else 0
@@ -525,12 +919,21 @@ def get_screen_detail(screen_id: int, db: Session = Depends(get_db)):
     return {
         "id": screen.id,
         "workflowRunId": screen.workflow_run_id,
+        "activeWorkflowRunId": active_run_id,
         "name": screen.name,
         "status": screen.status,
         "contentType": screen.content_type,
         "screeningBrief": screening_brief,
         "contentExtraction": content_extraction,
         "sourceBias": source_bias,
+        "refreshCount": int(screen.refresh_count or 0),
+        "isRefreshing": (
+            (screen.active_workflow_run_id is not None)
+            and (screen.active_workflow_run_id != screen.workflow_run_id)
+        ),
+        "lastRefreshedAt": (
+            screen.last_refreshed_at.isoformat() if screen.last_refreshed_at else None
+        ),
         "currentPhase": current_phase,
         "isCertified": bool(screen.is_certified),
         "certifiedAt": screen.certified_at.isoformat() if screen.certified_at else None,
@@ -1506,16 +1909,24 @@ def get_synthesis(
 
     # Convert all nested keys first, then extract with camelCase names
     content = _deep_camel(content)
+    synthesis_payload = {
+        "narrative": content.get("narrative"),
+        "disagreements": content.get("disagreements", []),
+        "finalTierAdjustments": content.get("finalTierAdjustments", []),
+        "overallConviction": content.get("overallConviction"),
+        "keyRisks": content.get("keyRisks", []),
+    }
 
     return {
         "screenId": screen_id,
-        "synthesis": {
-            "narrative": content.get("narrative"),
-            "disagreements": content.get("disagreements", []),
-            "finalTierAdjustments": content.get("finalTierAdjustments", []),
-            "overallConviction": content.get("overallConviction"),
-            "keyRisks": content.get("keyRisks", []),
-        },
+        # Backward-compatible top-level shape.
+        "narrative": synthesis_payload["narrative"],
+        "disagreements": synthesis_payload["disagreements"],
+        "finalTierAdjustments": synthesis_payload["finalTierAdjustments"],
+        "overallConviction": synthesis_payload["overallConviction"],
+        "keyRisks": synthesis_payload["keyRisks"],
+        # New nested shape used by the frontend.
+        "synthesis": synthesis_payload,
         "createdAt": review.created_at.isoformat() if review.created_at else None,
     }
 
@@ -1684,7 +2095,10 @@ def get_catalyst_calendar(screen_id: int, db: Session = Depends(get_db)):
         "screenId": screen_id,
         "catalysts": catalysts,
         "totalCatalysts": calendar.total_catalysts,
-        "nextCatalyst": next_catalyst,
+        # Backward-compatible legacy field.
+        "nextCatalyst": calendar.next_catalyst_date,
+        # Richer field for the frontend.
+        "nextCatalystDetails": next_catalyst,
         "createdAt": calendar.created_at.isoformat() if calendar.created_at else None,
     }
 
@@ -1813,7 +2227,10 @@ def get_stress_tests(screen_id: int, db: Session = Depends(get_db)):
         "screenId": screen_id,
         "frameworkTests": framework_tests,
         "nameTests": name_tests,
-        "survivalScores": survival_scores,
+        # Backward-compatible legacy shape.
+        "survivalScores": _deep_camel(raw_survival) if raw_survival is not None else [],
+        # New summary shape used by the frontend.
+        "survivalSummary": survival_scores,
         "createdAt": stress.created_at.isoformat() if stress.created_at else None,
     }
 
@@ -1849,13 +2266,19 @@ def get_report(screen_id: int, db: Session = Depends(get_db)):
             ),
         )
 
+    metadata = _deep_camel(_safe_json_parse(report.report_metadata))
     return {
         "screenId": screen_id,
+        # Backward-compatible legacy fields.
+        "title": report.title,
+        "content": report.content,
+        "metadata": metadata,
+        # New nested shape used by the frontend.
         "report": {
             "id": report.id,
             "title": report.title,
             "content": report.content,
-            "metadata": _deep_camel(_safe_json_parse(report.report_metadata)),
+            "metadata": metadata,
         },
         "createdAt": report.created_at.isoformat() if report.created_at else None,
     }

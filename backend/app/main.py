@@ -12,7 +12,19 @@ from slowapi.errors import RateLimitExceeded
 from app.config import settings
 from app.database import engine
 from app.models import Base
-from app.routers import analyze, search, portfolio, alerts, workflows, ist, hfrt, frameworks, personas, bridge
+from app.routers import (
+    alerts,
+    analyze,
+    bridge,
+    frameworks,
+    hfrt,
+    ist,
+    ist_synthesis,
+    personas,
+    portfolio,
+    search,
+    workflows,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,6 +65,7 @@ app.include_router(portfolio.router)
 app.include_router(alerts.router)
 app.include_router(workflows.router)
 app.include_router(ist.router)
+app.include_router(ist_synthesis.router)
 app.include_router(hfrt.router)
 app.include_router(frameworks.router)
 app.include_router(personas.router)
@@ -64,6 +77,8 @@ from app.services.ist import thematic_analysis as _ist_thematic_analysis  # noqa
 from app.services.ist import equity_identification as _ist_equity_identification  # noqa: F401
 from app.services.ist import dialectic as _ist_dialectic  # noqa: F401
 from app.services.ist import final_synthesis as _ist_final_synthesis  # noqa: F401
+from app.services.ist import refresh as _ist_refresh  # noqa: F401
+from app.services.ist import synthesis as _ist_synthesis  # noqa: F401
 
 # Register HFRT step handlers by importing the service modules
 from app.services.hfrt import idea_screener as _hfrt_idea_screener  # noqa: F401
