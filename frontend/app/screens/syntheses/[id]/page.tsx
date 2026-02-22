@@ -30,6 +30,16 @@ import type { WorkflowDetail, WorkflowStatus, WorkflowStep } from "@/types/workf
 
 type Tab = "report" | "overlap" | "interactions" | "tier-changes" | "equities" | "dialectic" | "handoff";
 
+const TAB_LABELS: Record<Tab, string> = {
+  report: "Report",
+  overlap: "Overlap Matrix",
+  interactions: "Thesis Interactions",
+  "tier-changes": "Tier Changes",
+  equities: "Equities",
+  dialectic: "Dialectic",
+  handoff: "HFRT Handoff",
+};
+
 export default function SynthesisDetailPage() {
   const params = useParams();
   const synthesisId = Number(params.id);
@@ -50,9 +60,14 @@ export default function SynthesisDetailPage() {
     try {
       const detail = await getSynthesis(synthesisId);
       setSynthesis(detail);
-      const wf = await getWorkflow(detail.workflowRunId);
+
+      const [wf, eq] = await Promise.all([
+        getWorkflow(detail.workflowRunId),
+        detail.status === "COMPLETED"
+          ? getSynthesisEquities(detail.id)
+          : Promise.resolve({ equities: [] as SynthesisEquity[] }),
+      ]);
       setWorkflow(wf);
-      const eq = await getSynthesisEquities(detail.id);
       setEquities(eq.equities);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load synthesis");
@@ -66,9 +81,14 @@ export default function SynthesisDetailPage() {
     try {
       const detail = await getSynthesis(synthesisId);
       setSynthesis(detail);
-      const wf = await getWorkflow(detail.workflowRunId);
+
+      const [wf, eq] = await Promise.all([
+        getWorkflow(detail.workflowRunId),
+        detail.status === "COMPLETED"
+          ? getSynthesisEquities(detail.id)
+          : Promise.resolve({ equities: [] as SynthesisEquity[] }),
+      ]);
       setWorkflow(wf);
-      const eq = await getSynthesisEquities(detail.id);
       setEquities(eq.equities);
     } catch {
       // Silent refresh.
@@ -191,7 +211,7 @@ export default function SynthesisDetailPage() {
               tab === t ? "text-primary border-b-2 border-primary" : "text-text-secondary hover:text-text-primary"
             )}
           >
-            {t}
+            {TAB_LABELS[t]}
           </button>
         ))}
       </div>

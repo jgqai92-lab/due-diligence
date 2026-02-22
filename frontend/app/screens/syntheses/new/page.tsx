@@ -43,10 +43,15 @@ export default function NewSynthesisPage() {
     setSubmitting(true);
     setError(null);
     try {
+      const idempotencyKey =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `synth-${Date.now()}`;
       const created = await createSynthesis({
         name: name.trim(),
         screenIds: selectedIds,
         autoAdvance,
+        idempotencyKey,
       });
       await advanceWorkflow(created.workflowRunId);
       router.push(`/screens/syntheses/${created.id}`);
@@ -119,4 +124,3 @@ export default function NewSynthesisPage() {
     </div>
   );
 }
-

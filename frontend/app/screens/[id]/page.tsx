@@ -747,19 +747,21 @@ export default function ScreenDetailPage() {
         <HandoffPanel screenId={screenId} isCertified={screen.isCertified} />
       )}
 
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        <RefreshHistory
-          refreshes={refreshes}
-          selectedRefreshId={selectedRefreshId}
-          onSelectRefresh={setSelectedRefreshId}
-        />
-        <RefreshDelta
-          detail={selectedRefresh}
-          claims={selectedRefreshClaims}
-          loading={refreshDetailLoading}
-          error={refreshDetailError}
-        />
-      </div>
+      {(refreshes.length > 0 || screen.refreshCount > 0) && (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <RefreshHistory
+            refreshes={refreshes}
+            selectedRefreshId={selectedRefreshId}
+            onSelectRefresh={setSelectedRefreshId}
+          />
+          <RefreshDelta
+            detail={selectedRefresh}
+            claims={selectedRefreshClaims}
+            loading={refreshDetailLoading}
+            error={refreshDetailError}
+          />
+        </div>
+      )}
 
       {/* Original Inputs (collapsible) */}
       {showInputs && (
