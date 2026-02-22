@@ -12,6 +12,7 @@ import TierChanges from "@/components/ist/synthesis/TierChanges";
 import SynthesisEquities from "@/components/ist/synthesis/SynthesisEquities";
 import SynthesisReport from "@/components/ist/synthesis/SynthesisReport";
 import SynthesisHandoff from "@/components/ist/synthesis/SynthesisHandoff";
+import MarkdownNarrative from "@/components/MarkdownNarrative";
 import {
   getSynthesis,
   getSynthesisDialectic,
@@ -155,6 +156,13 @@ export default function SynthesisDetailPage() {
     await refresh();
   };
 
+  const dialecticData = (dialecticContent ?? {}) as Record<string, unknown>;
+  const dialecticNarrative =
+    typeof dialecticData.narrative === "string" ? dialecticData.narrative : null;
+  const dialecticKeyPoints = Array.isArray(dialecticData.key_points)
+    ? dialecticData.key_points.filter((point): point is string => typeof point === "string")
+    : [];
+
   if (loading) return <p className="text-sm text-text-secondary">Loading synthesis...</p>;
   if (!synthesis) return <p className="text-sm text-red-400">{error ?? "Synthesis not found."}</p>;
 
@@ -247,9 +255,32 @@ export default function SynthesisDetailPage() {
               </button>
             ))}
           </div>
-          <pre className="text-xs text-text-secondary bg-[rgba(10,15,26,0.6)] border border-border rounded-lg p-4 overflow-auto">
-            {JSON.stringify(dialecticContent, null, 2)}
-          </pre>
+          {dialecticContent ? (
+            <div className="space-y-4">
+              {dialecticNarrative && (
+                <MarkdownNarrative content={dialecticNarrative} />
+              )}
+              {dialecticKeyPoints.length > 0 && (
+                <div className="space-y-1.5">
+                  <h4 className="text-xs font-semibold text-text-secondary uppercase tracking-wide">
+                    Key Points
+                  </h4>
+                  <ul className="space-y-1 text-sm text-text-primary">
+                    {dialecticKeyPoints.map((point, index) => (
+                      <li key={index} className="flex gap-2">
+                        <span className="text-primary mt-0.5">-</span>
+                        <span>{point}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          ) : (
+            <p className="text-sm text-text-secondary">
+              No dialectic content available for this side.
+            </p>
+          )}
         </div>
       )}
       {tab === "handoff" && (
