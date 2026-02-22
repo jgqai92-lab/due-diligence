@@ -3,12 +3,16 @@
 import json
 from datetime import datetime, timezone
 
-from app.models.ist import ISTClaim, ISTEquityCandidate, ISTScreen
+import pytest
+from sqlalchemy.orm import sessionmaker
+
+from app.models.ist import ISTBottleneck, ISTClaim, ISTEquityCandidate, ISTScreen
 from app.models.ist_refresh import ISTScreenRefresh
 from app.models.ist_synthesis import ISTSynthesisSource
 from app.models.workflow import WorkflowRun, WorkflowStep
 from app.services.ist.refresh import IST_REFRESH_WORKFLOW_STEPS
 from app.services.ist.synthesis import IST_SYNTHESIS_WORKFLOW_STEPS
+from app.services.ist import synthesis as synthesis_service
 
 
 VALID_CONTENT = (
@@ -42,6 +46,17 @@ def _mark_completed_certified(db, screen_id: int):
     run.status = "COMPLETED"
     run.current_phase = 5
     db.commit()
+
+
+def _extract_json_tag(user_prompt: str, tag: str):
+    start = user_prompt.find(f"<{tag}>")
+    end = user_prompt.find(f"</{tag}>")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    raw = user_prompt[start + len(tag) + 2 : end].strip()
+    if not raw:
+        return None
+    return json.loads(raw)
 
 
 class TestISTRefreshEndpoints:
@@ -278,3 +293,196 @@ class TestISTSynthesisEndpoints:
         sources_data = sources_resp.json()
         assert len(sources_data["sources"]) == 2
 
+    @pytest.mark.asyncio
+    async def test_synthesis_workflow_outputs_and_endpoints(self, client, db, monkeypatch):
+        s1 = _create_screen(client, "Power Constraints", hypothesis="Grid bottlenecks constrain AI growth")
+        s2 = _create_screen(client, "Cooling Demand", hypothesis="Cooling demand accelerates capacity spend")
+        assert s1.status_code == 201
+        assert s2.status_code == 201
+        sid1 = s1.json()["id"]
+        sid2 = s2.json()["id"]
+        _mark_completed_certified(db, sid1)
+        _mark_completed_certified(db, sid2)
+
+        db.add_all(
+            [
+                ISTBottleneck(
+                    screen_id=sid1,
+                    name="Grid Interconnect Delays",
+                    phase=1,
+                    phase_label="Constrained Supply",
+                    description="Utilities cannot connect new capacity quickly enough.",
+                ),
+                ISTBottleneck(
+                    screen_id=sid2,
+                    name="Cooling Retrofits",
+                    phase=2,
+                    phase_label="Capacity Retrofit",
+                    description="Liquid cooling retrofits lag compute deployments.",
+                ),
+                ISTEquityCandidate(
+                    screen_id=sid1,
+                    ticker="VRT",
+                    company_name="Vertiv Holdings Co",
+                    bottleneck_id=None,
+                    scarcity_score=json.dumps({"overall": 4.0}),
+                    tier=2,
+                    conviction="MEDIUM",
+                ),
+                ISTEquityCandidate(
+                    screen_id=sid2,
+                    ticker="VRT",
+                    company_name="Vertiv Holdings Co",
+                    bottleneck_id=None,
+                    scarcity_score=json.dumps({"overall": 3.8}),
+                    tier=2,
+                    conviction="MEDIUM",
+                ),
+                ISTEquityCandidate(
+                    screen_id=sid2,
+                    ticker="ETN",
+                    company_name="Eaton Corp",
+                    bottleneck_id=None,
+                    scarcity_score=json.dumps({"overall": 3.5}),
+                    tier=3,
+                    conviction="LOW",
+                ),
+            ]
+        )
+        db.commit()
+
+        create_resp = client.post(
+            "/api/ist/syntheses",
+            json={
+                "name": "Power + Cooling Synthesis",
+                "screenIds": [sid1, sid2],
+                "autoAdvance": False,
+            },
+        )
+        assert create_resp.status_code == 201
+        synthesis_id = create_resp.json()["id"]
+        workflow_run_id = create_resp.json()["workflowRunId"]
+
+        test_session_local = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=db.get_bind(),
+        )
+        monkeypatch.setattr(synthesis_service, "SessionLocal", test_session_local)
+
+        async def fake_call_claude(system_prompt, user_prompt, response_model, **kwargs):
+            model_name = response_model.__name__
+            if model_name == "ThesisInteractionResult":
+                return response_model(
+                    classification="reinforcing",
+                    rationale="Both screens reinforce infrastructure capacity demand.",
+                    impact="Shared beneficiaries likely see stronger conviction.",
+                )
+            if model_name == "CombinedBottleneckResult":
+                return response_model(
+                    unified_cascade=[
+                        {"phase": 1, "name": "Grid Interconnect Delays"},
+                        {"phase": 2, "name": "Cooling Retrofits"},
+                    ],
+                    emergent_bottlenecks=["Transformer lead-time bottleneck"],
+                    temporal_sequence="Interconnect delays precede cooling retrofit demand spikes.",
+                    summary="Combined bottlenecks create a multi-quarter deployment lag.",
+                )
+            if model_name == "CrossScreenEffectsResult":
+                return response_model(
+                    effects_chains=[
+                        {
+                            "source": "Grid delays",
+                            "propagation": "Delayed compute deployments",
+                            "target": "Cooling retrofit timing",
+                        }
+                    ],
+                    feedback_loops=["Power delay -> retrofit delay -> backlog expansion"],
+                    summary="Cross-screen effects amplify cycle timing risk.",
+                )
+            if model_name == "TierReassessmentBatch":
+                baseline = _extract_json_tag(user_prompt, "equity_baseline") or []
+                assessments = []
+                for idx, row in enumerate(baseline):
+                    original_tier = int(row.get("originalTier", 3))
+                    new_tier = 1 if idx == 0 else original_tier
+                    ticker = row.get("ticker", "")
+                    assessments.append(
+                        {
+                            "ticker": ticker,
+                            "original_tier": original_tier,
+                            "new_tier": new_tier,
+                            "rationale": f"{ticker} benefits from cross-screen demand reinforcement.",
+                            "conviction": "HIGH" if new_tier == 1 else "MEDIUM",
+                            "combined_thesis": f"{ticker} sits at the intersection of both screen themes.",
+                        }
+                    )
+                return response_model(assessments=assessments)
+            if model_name == "_DialecticPayload":
+                prompt_lower = system_prompt.lower()
+                if "optimistic" in prompt_lower:
+                    return response_model(
+                        narrative="Optimist case: reinforcement across power and cooling supports upside.",
+                        key_points=["Demand reinforcement", "Improved conviction"],
+                    )
+                if "skeptical" in prompt_lower:
+                    return response_model(
+                        narrative="Pessimist case: sequencing and policy delays may cap upside.",
+                        key_points=["Timing risk", "Execution fragility"],
+                    )
+                return response_model(
+                    narrative="Balanced synthesis: upside exists, but sequencing risk must be monitored.",
+                    key_points=["Balanced risk/reward", "Monitor milestones"],
+                )
+            raise AssertionError(f"Unexpected response model: {model_name}")
+
+        async def fake_call_claude_raw(system_prompt, user_prompt, **kwargs):
+            return (
+                "# Combined Investment Thesis\n\n"
+                "## Executive Summary\n\n"
+                "Reinforcing cross-screen dynamics support a focused shortlist.\n\n"
+                "## Recommended Actions\n\n"
+                "- Prioritize Tier 1 names for HFRT handoff."
+            )
+
+        monkeypatch.setattr(synthesis_service, "call_claude", fake_call_claude)
+        monkeypatch.setattr(synthesis_service, "call_claude_raw", fake_call_claude_raw)
+
+        await synthesis_service.handle_screen_ingestion(workflow_run_id)
+        await synthesis_service.handle_overlap_matrix(workflow_run_id)
+        await synthesis_service.handle_thesis_interactions(workflow_run_id)
+        await synthesis_service.handle_synthesis_readiness_gate(workflow_run_id)
+        await synthesis_service.handle_combined_bottleneck_analysis(workflow_run_id)
+        await synthesis_service.handle_cross_screen_effects(workflow_run_id)
+        await synthesis_service.handle_re_tiering(workflow_run_id)
+        await synthesis_service.handle_synthesis_dialectic_optimist(workflow_run_id)
+        await synthesis_service.handle_synthesis_dialectic_pessimist(workflow_run_id)
+        await synthesis_service.handle_synthesis_final(workflow_run_id)
+
+        detail_resp = client.get(f"/api/ist/syntheses/{synthesis_id}")
+        assert detail_resp.status_code == 200
+        detail = detail_resp.json()
+        assert isinstance(detail["thesisInteractions"], list)
+        assert len(detail["thesisInteractions"]) > 0
+        assert isinstance(detail["combinedBrief"], dict)
+        assert detail["combinedBrief"]
+        assert isinstance(detail["tierChanges"], list)
+        assert detail["report"]
+
+        synth_dialectic_resp = client.get(
+            f"/api/ist/syntheses/{synthesis_id}/dialectic/SYNTHESIS"
+        )
+        assert synth_dialectic_resp.status_code == 200
+        synth_dialectic = synth_dialectic_resp.json()["content"]
+        assert isinstance(synth_dialectic.get("narrative"), str)
+        assert synth_dialectic["narrative"]
+        assert isinstance(synth_dialectic.get("key_points"), list)
+
+        equities_resp = client.get(f"/api/ist/syntheses/{synthesis_id}/equities")
+        assert equities_resp.status_code == 200
+        equities = equities_resp.json()["equities"]
+        assert equities
+        assert any(
+            (equity.get("tierChangeRationale") or "") != "No cross-screen adjustment"
+            for equity in equities
+        )
