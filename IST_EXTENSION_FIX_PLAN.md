@@ -1,740 +1,645 @@
-# IST Extension — Fix Plan
+# IST Synthesis — Fix Plan
 
-**Date:** 2026-02-21
+**Date:** 2026-02-22
 **Author:** Claude Code (CC)
-**Source:** Four-layer compliance review of Codex's IST extension implementation
-**Scope:** 11 critical issues, plus high-priority warnings that must ship together
+**Source:** Root cause analysis of live synthesis run (workflow 12) + four-layer compliance review
+**Scope:** 8 fixes to make the synthesis feature produce real analytical output
+
+---
+
+## Problem Summary
+
+A live synthesis combining two completed IST screens (AI Agents + Jordi Video) completed in **149ms** — proving that **zero Claude API calls** were made. The output is:
+
+- **Report tab:** Raw markdown table with "No cross-screen adjustment" for every equity
+- **Dialectic tab:** 404 error — no SYNTHESIS-side dialectic row exists
+- **HFRT Handoff tab:** Raw JSON dump (`JSON.stringify`)
+- **Tier Changes tab:** Empty — no tiers changed because the heuristic cannot produce `contradicting` classifications
+- **Thesis Interactions tab:** Generic "Theme overlap and tier alignment analysis" rationale for every pair
+
+Every synthesis step is a stub that uses hardcoded strings or count tables instead of calling Claude.
 
 ---
 
 ## How to Use This Document
 
-Each fix is numbered (F1–F16) with:
-- **Priority:** CRITICAL (blocks correctness) or HIGH (blocks quality)
-- **File(s):** Exact paths and line numbers
-- **Problem:** What's wrong
-- **Fix:** Exactly what to change
-- **Depends on:** Other fixes that must be applied first
+Each fix is numbered (F1–F8). Apply in order — F1–F5 are backend service changes (the core AI integration), F6–F8 are frontend rendering fixes.
 
-Apply fixes in the order listed — dependencies are already sorted.
+**Reference pattern:** The existing IST services (`content_extraction.py`, `thematic_analysis.py`, `equity_identification.py`, `dialectic.py`, `final_synthesis.py`) all follow this pattern for Claude calls:
+
+```python
+from app.services.claude_client import call_claude, call_claude_raw
+
+# Structured output:
+result = await call_claude(
+    system_prompt=SYSTEM_PROMPT,
+    user_prompt=user_prompt,
+    response_model=PydanticModel,
+)
+
+# Raw markdown output (returns str):
+result = await call_claude_raw(
+    system_prompt=SYSTEM_PROMPT,
+    user_prompt=user_prompt,
+)
+```
+
+All Claude calls MUST use XML tags for content/instruction separation (INV-AI-01).
 
 ---
 
-## Phase 1: Database & Schema Foundation (F1–F3)
-
-These must land first because service and API fixes depend on the correct column set.
-
-### F1 — Add Missing Columns to `ISTScreenRefresh` Model + Migration
+## F1 — Implement Claude-powered `thesis_interactions`
 
 **Priority:** CRITICAL
-**Files:**
-- `backend/app/models/ist_refresh.py` (lines 38–42)
-- `backend/alembic/versions/015_ist_synthesis_and_refresh.py` (lines 223–286)
+**File:** `backend/app/services/ist/synthesis.py`, lines 157–204
+**Current behavior:** Word-overlap heuristic. Can never produce `contradicting`. Every pair gets "Theme overlap and tier alignment analysis" as rationale.
 
-**Problem:** The model is missing 5 output columns that service handlers need to write delta results to: `new_claims_count`, `new_claims`, `new_source_bias`, `tier_changes`, `tier_change_count`. Without these, the refresh pipeline cannot persist its analytical output and the `ScreenRefreshDetail` API response cannot be populated.
+**Fix:** Replace the heuristic with a Claude call that analyzes each screen pair.
 
-**Fix — Model (`ist_refresh.py`):** Add the following columns after `steps_reexecuted` (line 41):
+Add a Pydantic response model:
 
 ```python
-    # Delta output columns
-    new_claims_count = Column(Integer, nullable=False, default=0)
-    new_claims = Column(Text, nullable=True)          # JSON: list of new/modified claim summaries
-    new_source_bias = Column(Text, nullable=True)      # JSON: bias assessment of delta content
-    tier_changes = Column(Text, nullable=True)          # JSON: list of {ticker, old_tier, new_tier}
-    tier_change_count = Column(Integer, nullable=False, default=0)
+class ThesisInteractionResult(BaseModel):
+    """Claude output for thesis interaction analysis."""
+    classification: str = Field(description="One of: reinforcing, contradicting, orthogonal")
+    rationale: str = Field(description="2-3 sentence explanation of why these theses interact this way")
+    impact: str = Field(description="How this interaction affects investment positioning")
 ```
 
-**Fix — Migration (`015_...py`):** Add matching `op.add_column` calls in the `ist_screen_refreshes` table creation section. Add `server_default="0"` for the integer columns.
-
-**Fix — Migration backfill SQL guard** (line ~313): Wrap the `active_workflow_run_id` backfill in `sa.text()` and add a NULL guard:
+Replace the inner loop body (lines 176–192) with:
 
 ```python
-op.execute(sa.text(
-    "UPDATE ist_screens SET active_workflow_run_id = workflow_run_id "
-    "WHERE active_workflow_run_id IS NULL AND workflow_run_id IS NOT NULL"
+# Batch preload all screens referenced by sources to avoid N+1 queries
+screen_ids_set = {s.screen_id for s in sources}
+screens_list = db.query(ISTScreen).filter(ISTScreen.id.in_(screen_ids_set)).all()
+screen_map = {s.id: s for s in screens_list}
+
+n = len(sources)
+total_pairs = max(1, n * (n - 1) // 2)
+pair_idx = 0
+
+for i in range(n):
+    for j in range(i + 1, n):
+        a = sources[i]
+        b = sources[j]
+
+        # Look up from pre-fetched map (no per-pair DB query)
+        screen_a = screen_map.get(a.screen_id)
+        screen_b = screen_map.get(b.screen_id)
+
+        a_extraction = _load_json(screen_a.content_extraction, {}) if screen_a else {}
+        b_extraction = _load_json(screen_b.content_extraction, {}) if screen_b else {}
+        a_brief = _load_json(screen_a.screening_brief, {}) if screen_a else {}
+        b_brief = _load_json(screen_b.screening_brief, {}) if screen_b else {}
+
+        user_prompt = (
+            f"<screen_a>\n"
+            f"Name: {a.screen_name}\n"
+            f"Primary Theme: {a.primary_theme or 'Not specified'}\n"
+            f"Hypothesis: {a_brief.get('hypothesis', 'N/A')}\n"
+            f"Key Themes: {json.dumps(a_extraction.get('themes', []))}\n"
+            f"Tier 1 Count: {a.tier1_count}, Tier 2: {a.tier2_count}, Tier 3: {a.tier3_count}\n"
+            f"</screen_a>\n\n"
+            f"<screen_b>\n"
+            f"Name: {b.screen_name}\n"
+            f"Primary Theme: {b.primary_theme or 'Not specified'}\n"
+            f"Hypothesis: {b_brief.get('hypothesis', 'N/A')}\n"
+            f"Key Themes: {json.dumps(b_extraction.get('themes', []))}\n"
+            f"Tier 1 Count: {b.tier1_count}, Tier 2: {b.tier2_count}, Tier 3: {b.tier3_count}\n"
+            f"</screen_b>\n\n"
+            f"Analyze how the investment thesis of Screen A interacts with Screen B.\n"
+            f"Classify the relationship as exactly one of: reinforcing, contradicting, orthogonal.\n"
+            f"- reinforcing: theses amplify each other's conviction or share beneficiaries\n"
+            f"- contradicting: theses undermine each other or create opposing market bets\n"
+            f"- orthogonal: theses are independent with no meaningful interaction\n\n"
+            f"Return JSON matching: {ThesisInteractionResult.model_json_schema()}"
+        )
+
+        result = await call_claude(
+            system_prompt="You are an investment analyst comparing two screening theses. Be precise and cite specific themes.",
+            user_prompt=user_prompt,
+            response_model=ThesisInteractionResult,
+        )
+
+        interactions.append({
+            "screenA": {"id": a.screen_id, "name": a.screen_name, "theme": a.primary_theme},
+            "screenB": {"id": b.screen_id, "name": b.screen_name, "theme": b.primary_theme},
+            "classification": result.classification,
+            "rationale": result.rationale,
+            "impact": result.impact,
+        })
+
+        pair_idx += 1
+        await emit_sse_event(workflow_run_id, "step_progress", {
+            "stepName": "thesis_interactions",
+            "message": f"Analyzed {a.screen_name} × {b.screen_name}: {result.classification}",
+            "percent": int((pair_idx / total_pairs) * 100),
+        })
+```
+
+Add import at top of file:
+```python
+from app.services.claude_client import call_claude, call_claude_raw
+```
+
+**Depends on:** Nothing
+
+---
+
+## F2 — Implement Claude-powered `combined_bottleneck_analysis` and `cross_screen_effects`
+
+**Priority:** CRITICAL
+**File:** `backend/app/services/ist/synthesis.py`, lines 232–298
+**Current behavior:** `combined_bottleneck_analysis` counts bottlenecks by phase. `cross_screen_effects` counts reinforcing pairs. Neither calls Claude.
+
+**Fix — `combined_bottleneck_analysis` (lines 232–270):**
+
+Add a Pydantic model:
+
+```python
+class CombinedBottleneckResult(BaseModel):
+    """Claude output for combined bottleneck cascade analysis."""
+    unified_cascade: list[dict] = Field(description="Ordered list of bottleneck phases with cross-screen dependencies")
+    emergent_bottlenecks: list[str] = Field(description="New bottleneck dependencies that only emerge from combining screens")
+    temporal_sequence: str = Field(description="How bottlenecks across screens interact temporally")
+    summary: str = Field(description="2-3 paragraph analysis of the combined bottleneck landscape")
+```
+
+After loading bottlenecks (line 251), batch preload screens, then build a detailed prompt with all bottleneck names, phases, demand models, and screen associations. Call Claude:
+
+```python
+# Batch preload screens for all bottlenecks to avoid N+1
+bn_screen_ids = {b.screen_id for b in bottlenecks if b.screen_id}
+bn_screens = db.query(ISTScreen).filter(ISTScreen.id.in_(bn_screen_ids)).all()
+bn_screen_map = {s.id: s for s in bn_screens}
+
+bottleneck_data = []
+for b in bottlenecks:
+    screen = bn_screen_map.get(b.screen_id)
+    bottleneck_data.append({
+        "name": b.name,
+        "phase": b.phase,
+        "screenName": screen.name if screen else "Unknown",
+        "severity": _load_json(b.severity, None),
+    })
+
+user_prompt = (
+    f"<bottlenecks>\n{json.dumps(bottleneck_data, indent=2)}\n</bottlenecks>\n\n"
+    f"<thesis_interactions>\n{synthesis.thesis_interactions or '[]'}\n</thesis_interactions>\n\n"
+    f"Build a unified bottleneck cascade from these {len(bottlenecks)} bottlenecks across {len(screen_ids)} screens.\n"
+    f"Identify NEW bottleneck dependencies that only emerge from the combination.\n"
+    f"Map the temporal sequence of how bottlenecks across different screens interact.\n\n"
+    f"Return JSON matching: {CombinedBottleneckResult.model_json_schema()}"
+)
+
+result = await call_claude(
+    system_prompt="You are an investment analyst building unified bottleneck cascade models from multiple screening theses.",
+    user_prompt=user_prompt,
+    response_model=CombinedBottleneckResult,
+)
+
+combined = {
+    "sourceScreenCount": len(screen_ids),
+    "bottleneckCount": len(bottlenecks),
+    "unifiedCascade": result.unified_cascade,
+    "emergentBottlenecks": result.emergent_bottlenecks,
+    "temporalSequence": result.temporal_sequence,
+    "summary": result.summary,
+}
+```
+
+**Fix — `cross_screen_effects` (lines 273–298):**
+
+Add a Pydantic model:
+
+```python
+class CrossScreenEffectsResult(BaseModel):
+    """Claude output for cross-screen effects chain analysis."""
+    effects_chains: list[dict] = Field(description="Cross-screen effects where Screen A's Nth-order effect feeds Screen B")
+    feedback_loops: list[str] = Field(description="Identified feedback loops between screens")
+    summary: str = Field(description="2-3 paragraph analysis of cross-screen effects")
+```
+
+Load the overlap matrix, thesis interactions, and combined bottleneck data. Build a prompt asking Claude to map cross-screen effects chains (where Screen A's 3rd-order effect feeds into Screen B's 1st-order). Call Claude and store the result in `combined_brief`.
+
+**Depends on:** Nothing
+
+---
+
+## F3 — Implement Claude-powered `re_tiering`
+
+**Priority:** CRITICAL
+**File:** `backend/app/services/ist/synthesis.py`, lines 301–381
+**Current behavior:** Purely heuristic. Only upgrades if `len(appearances) >= 2 AND has_reinforcing`. Only downgrades if `has_contradicting` (which is impossible without F1). Every ticker gets "No cross-screen adjustment."
+
+**Fix:** Replace the tier adjustment logic with a Claude call that evaluates each multi-screen ticker (or tickers affected by thesis interactions) using the full analytical context.
+
+Add a Pydantic model:
+
+```python
+class TierReassessment(BaseModel):
+    """Claude's tier reassessment for a single equity."""
+    ticker: str
+    original_tier: int
+    new_tier: int
+    rationale: str = Field(description="Why the tier was changed or maintained, citing cross-screen evidence")
+    conviction: str = Field(description="HIGH, MEDIUM, or LOW")
+    combined_thesis: str = Field(description="How the combined screens affect the investment case for this equity")
+```
+
+class TierReassessmentBatch(BaseModel):
+    """Claude's reassessment for all equities."""
+    assessments: list[TierReassessment]
+```
+
+Build a prompt containing:
+- The full overlap matrix (which tickers appear in which screens at which tiers)
+- The thesis interactions (reinforcing/contradicting/orthogonal with rationales from F1)
+- The combined bottleneck analysis (from F2)
+- The cross-screen effects (from F2)
+
+Ask Claude to reassess each ticker's tier, specifically looking for:
+- Multi-screen tickers where reinforcing theses should upgrade the tier
+- Tickers exposed to contradicting theses that should downgrade
+- Single-screen tickers that gain or lose conviction from cross-screen effects
+
+The response replaces the current heuristic loop.
+
+**Depends on:** F1, F2 (needs real thesis interaction and bottleneck data)
+
+---
+
+## F4 — Implement Claude-powered dialectic (optimist, pessimist) + create SYNTHESIS row
+
+**Priority:** CRITICAL
+**File:** `backend/app/services/ist/synthesis.py`, lines 384–446 (optimist), lines 417–446 (pessimist), lines 449–513 (final)
+**Current behavior:**
+- Optimist: hardcoded string *"thesis interactions reinforce upside optionality"*
+- Pessimist: hardcoded string *"cross-screen coupling introduces fragility"*
+- Final: markdown table from DB, no Claude. No SYNTHESIS dialectic row created (causes 404).
+
+**Fix — `synthesis_dialectic_optimist` (lines 384–414):**
+
+Build a comprehensive data package with overlap matrix, thesis interactions, tier changes, combined bottleneck analysis, and cross-screen effects. Call Claude with a system prompt instructing it to build the optimist case for the combined thesis:
+
+```python
+data_package = {
+    "overlapMatrix": _load_json(synthesis.overlap_matrix, []),
+    "thesisInteractions": _load_json(synthesis.thesis_interactions, []),
+    "tierChanges": _load_json(synthesis.tier_changes, []),
+    "combinedBottlenecks": _load_json(synthesis.combined_brief, {}),
+}
+
+user_prompt = (
+    f"<synthesis_data>\n{json.dumps(data_package, indent=2)}\n</synthesis_data>\n\n"
+    f"Build the OPTIMIST case for the combined investment thesis '{synthesis.name}'.\n"
+    f"Focus on: cross-screen reinforcement, emergent opportunities, amplified conviction.\n"
+    f"Structure as: narrative (3-5 paragraphs) and key_points (5-8 bullet points).\n\n"
+    f"Return JSON matching: {_DialecticPayload.model_json_schema()}"
+)
+
+result = await call_claude(
+    system_prompt="You are an optimistic investment analyst synthesizing multiple screening theses to build the strongest possible bull case.",
+    user_prompt=user_prompt,
+    response_model=_DialecticPayload,
+)
+```
+
+**Fix — `synthesis_dialectic_pessimist` (lines 417–446):** Same pattern but with pessimist system prompt focusing on: concentration risk, thesis contradictions, timing fragility, execution sequencing risk.
+
+**Fix — `synthesis_final` (lines 449–513):**
+
+1. Call `call_claude_raw` to generate a comprehensive markdown report (matching the `handle_report_generation` pattern in `final_synthesis.py`). The prompt should include the full data package plus both dialectic narratives:
+
+```python
+optimist = db.query(ISTSynthesisDialectic).filter(
+    ISTSynthesisDialectic.synthesis_id == synthesis.id,
+    ISTSynthesisDialectic.side == "OPTIMIST",
+).first()
+
+pessimist = db.query(ISTSynthesisDialectic).filter(
+    ISTSynthesisDialectic.synthesis_id == synthesis.id,
+    ISTSynthesisDialectic.side == "PESSIMIST",
+).first()
+
+report_prompt = (
+    # ... full data package + dialectic content ...
+    f"Write a comprehensive Combined Investment Thesis Report in markdown.\n"
+    f"Include: Executive Summary, Cross-Screen Analysis, Tier Reassessment Rationale, "
+    f"Risk Assessment, Recommended Actions, HFRT Research Priorities.\n"
+)
+
+report = await call_claude_raw(
+    system_prompt="You are a senior investment analyst writing the definitive cross-screen synthesis report.",
+    user_prompt=report_prompt,
+)
+
+synthesis.combined_report = report
+```
+
+2. **Create a SYNTHESIS dialectic row** so the frontend `dialectic/SYNTHESIS` endpoint doesn't 404:
+
+```python
+# After generating the report, create a SYNTHESIS dialectic combining both views
+synthesis_prompt = (
+    f"<optimist>\n{optimist.content if optimist else '{}'}\n</optimist>\n"
+    f"<pessimist>\n{pessimist.content if pessimist else '{}'}\n</pessimist>\n\n"
+    f"Synthesize the optimist and pessimist views into a balanced assessment.\n"
+    f"Return JSON matching: {_DialecticPayload.model_json_schema()}"
+)
+
+synthesis_dialectic = await call_claude(
+    system_prompt="You are a balanced investment analyst reconciling bull and bear cases.",
+    user_prompt=synthesis_prompt,
+    response_model=_DialecticPayload,
+)
+
+db.add(ISTSynthesisDialectic(
+    synthesis_id=synthesis.id,
+    side="SYNTHESIS",
+    content=synthesis_dialectic.model_dump_json(),
 ))
 ```
 
-**Depends on:** Nothing
+**Depends on:** F1, F2, F3 (needs real data from all prior steps)
 
 ---
 
-### F2 — Verify Migration Chain
-
-**Priority:** CRITICAL
-**Files:** `backend/alembic/versions/`
-
-**Problem:** Migration 015 uses bare revision ID `"015"` chaining to `"014"`. The chain must resolve cleanly.
-
-**Fix:** Run:
-```bash
-cd backend
-source venv/Scripts/activate
-alembic history
-alembic check
-```
-
-If the chain resolves, no code change needed — just confirm. If it fails, update the `down_revision` to match the actual previous revision string.
-
-**Depends on:** F1
-
----
-
-### F3 — Create Response Schemas for Synthesis and Refresh
-
-**Priority:** CRITICAL
-**Files:**
-- NEW: `backend/app/schemas/ist_synthesis.py`
-- MODIFY: `backend/app/schemas/ist.py` (add refresh response schemas + `source_refresh_id` to `ISTClaimResponse`)
-- MODIFY: `backend/app/routers/ist_synthesis.py` (update imports)
-
-**Problem:** The plan requires `backend/app/schemas/ist_synthesis.py` with full synthesis response schemas. It was never created. The routers currently return raw dicts, bypassing Pydantic validation. `ISTClaimResponse` is also missing `source_refresh_id`.
-
-**Fix — Create `backend/app/schemas/ist_synthesis.py`:**
-
-```python
-"""Pydantic schemas for IST synthesis endpoints."""
-
-from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, Field, ConfigDict
-
-
-class SynthesisSourceResponse(BaseModel):
-    id: int
-    screen_id: int = Field(alias="screenId")
-    screen_name: str = Field(alias="screenName")
-    primary_theme: Optional[str] = Field(default=None, alias="primaryTheme")
-    tier1_count: int = Field(default=0, alias="tier1Count")
-    tier2_count: int = Field(default=0, alias="tier2Count")
-    tier3_count: int = Field(default=0, alias="tier3Count")
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
-
-class SynthesisEquityResponse(BaseModel):
-    id: int
-    ticker: str
-    company_name: Optional[str] = Field(default=None, alias="companyName")
-    original_tier: int = Field(alias="originalTier")
-    new_tier: int = Field(alias="newTier")
-    conviction: Optional[str] = None
-    rationale: Optional[str] = None
-    source_screen_ids: Optional[str] = Field(default=None, alias="sourceScreenIds")
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
-
-class SynthesisDialecticResponse(BaseModel):
-    id: int
-    side: str
-    narrative: Optional[str] = None
-    key_arguments: Optional[str] = Field(default=None, alias="keyArguments")
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
-
-class SynthesisListItem(BaseModel):
-    id: int
-    name: str
-    status: str
-    workflow_run_id: int = Field(alias="workflowRunId")
-    source_screen_count: int = Field(default=0, alias="sourceScreenCount")
-    tier_change_count: int = Field(default=0, alias="tierChangeCount")
-    is_certified: int = Field(default=0, alias="isCertified")
-    certified_at: Optional[datetime] = Field(default=None, alias="certifiedAt")
-    created_at: datetime = Field(alias="createdAt")
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
-
-class SynthesisDetailResponse(BaseModel):
-    id: int
-    name: str
-    status: str
-    workflow_run_id: int = Field(alias="workflowRunId")
-    source_screen_count: int = Field(default=0, alias="sourceScreenCount")
-    tier_change_count: int = Field(default=0, alias="tierChangeCount")
-    is_certified: int = Field(default=0, alias="isCertified")
-    certified_at: Optional[datetime] = Field(default=None, alias="certifiedAt")
-    overlap_matrix: Optional[str] = Field(default=None, alias="overlapMatrix")
-    thesis_interactions: Optional[str] = Field(default=None, alias="thesisInteractions")
-    combined_brief: Optional[str] = Field(default=None, alias="combinedBrief")
-    combined_report: Optional[str] = Field(default=None, alias="combinedReport")
-    created_at: datetime = Field(alias="createdAt")
-    updated_at: Optional[datetime] = Field(default=None, alias="updatedAt")
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-```
-
-**Fix — Add to `backend/app/schemas/ist.py`:**
-
-Add `source_refresh_id: Optional[int] = Field(default=None, alias="sourceRefreshId")` to the `ISTClaimResponse` class.
-
-Add refresh response schemas:
-
-```python
-class ScreenRefreshListItem(BaseModel):
-    id: int
-    refresh_number: int = Field(alias="refreshNumber")
-    status: str
-    content_type: str = Field(alias="contentType")
-    new_claims_count: int = Field(default=0, alias="newClaimsCount")
-    tier_change_count: int = Field(default=0, alias="tierChangeCount")
-    created_at: datetime = Field(alias="createdAt")
-    completed_at: Optional[datetime] = Field(default=None, alias="completedAt")
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
-
-class ScreenRefreshDetail(BaseModel):
-    id: int
-    refresh_number: int = Field(alias="refreshNumber")
-    status: str
-    content_type: str = Field(alias="contentType")
-    delta_content: str = Field(alias="deltaContent")
-    new_claims_count: int = Field(default=0, alias="newClaimsCount")
-    new_claims: Optional[str] = Field(default=None, alias="newClaims")
-    new_source_bias: Optional[str] = Field(default=None, alias="newSourceBias")
-    tier_changes: Optional[str] = Field(default=None, alias="tierChanges")
-    tier_change_count: int = Field(default=0, alias="tierChangeCount")
-    impact_assessment: Optional[str] = Field(default=None, alias="impactAssessment")
-    steps_reexecuted: Optional[str] = Field(default=None, alias="stepsReexecuted")
-    error_message: Optional[str] = Field(default=None, alias="errorMessage")
-    created_at: datetime = Field(alias="createdAt")
-    completed_at: Optional[datetime] = Field(default=None, alias="completedAt")
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-```
-
-**Fix — Update imports in `ist_synthesis.py` router:**
-Change `from app.schemas.ist import ISTSynthesisCreate` to also import from `app.schemas.ist_synthesis`.
-
-**Depends on:** F1
-
----
-
-## Phase 2: Service Layer Fixes (F4–F8)
-
-These fix behavioral defects in the workflow handlers.
-
-### F4 — Extract `_run_*` Functions from `final_synthesis.py`
-
-**Priority:** CRITICAL
-**Files:** `backend/app/services/ist/final_synthesis.py` (1554 lines)
-
-**Problem:** The plan (CC Resolution A2) required extracting core logic from all 5 service files. `final_synthesis.py` was not refactored. The refresh service's `conditional_resynthesis` calls registered handlers directly with `canonical_run_id`, which:
-1. Emits SSE events on the original run ID (refresh SSE subscribers miss them)
-2. Sets `screen.status = "SYNTHESIZING"` at line 588, violating Resolution B2
-
-**Fix:** For each of the 5 Phase 5 handlers that run Claude or produce artifacts (`handle_master_screen`, `handle_rotation_strategy`, `handle_catalyst_calendar`, `handle_stress_tests`, `handle_report_generation`), extract the core logic into a `_run_*` function with this signature pattern:
-
-```python
-async def _run_master_screen(
-    db: Session,
-    screen: ISTScreen,
-    workflow_run_id: int,  # for SSE — allows refresh to pass its own run ID
-    *,
-    update_screen_status: bool = False,  # default False for safety
-) -> dict:
-    """Core master screen logic, reusable by IST and IST_REFRESH."""
-    if update_screen_status:
-        screen.status = "SYNTHESIZING"
-        screen.updated_at = datetime.now(timezone.utc)
-        db.commit()
-    # ... existing Claude call and artifact creation logic ...
-```
-
-The existing registered handlers become thin wrappers:
-
-```python
-@register_step("IST", "master_screen")
-async def handle_master_screen(workflow_run_id: int) -> dict | None:
-    db = SessionLocal()
-    try:
-        screen = db.query(ISTScreen).filter(ISTScreen.workflow_run_id == workflow_run_id).first()
-        if not screen:
-            raise ValueError(f"No IST screen for workflow {workflow_run_id}")
-        return await _run_master_screen(db, screen, workflow_run_id, update_screen_status=True)
-    finally:
-        db.close()
-```
-
-Apply the same pattern to: `_run_rotation_strategy`, `_run_catalyst_calendar`, `_run_stress_tests`, `_run_report_generation`.
-
-The `handle_screen_certification` and `handle_hfrt_handoff_generation` handlers do NOT call Claude and can stay as-is, but they also set `screen.status`. Extract `_run_screen_certification` and `_run_hfrt_handoff_generation` with the same `update_screen_status` guard.
-
-**Depends on:** Nothing
-
----
-
-### F5 — Fix `conditional_resynthesis` in Refresh Service
-
-**Priority:** CRITICAL
-**Files:** `backend/app/services/ist/refresh.py` (lines 474–505)
-
-**Problem:** `conditional_resynthesis` calls `handle_master_screen(canonical_run_id)` etc., which emits SSE on the wrong run and mutates screen status.
-
-**Fix:** After F4 is applied, update `conditional_resynthesis` to call the extracted functions:
-
-```python
-# Replace lines 483-488 with:
-await _run_master_screen(db, screen, workflow_run_id, update_screen_status=False)
-await _run_rotation_strategy(db, screen, workflow_run_id, update_screen_status=False)
-await _run_catalyst_calendar(db, screen, workflow_run_id, update_screen_status=False)
-await _run_stress_tests(db, screen, workflow_run_id, update_screen_status=False)
-await _run_report_generation(db, screen, workflow_run_id, update_screen_status=False)
-```
-
-Import the `_run_*` functions from `final_synthesis.py`:
-```python
-from app.services.ist.final_synthesis import (
-    _run_master_screen,
-    _run_rotation_strategy,
-    _run_catalyst_calendar,
-    _run_stress_tests,
-    _run_report_generation,
-)
-```
-
-Also fix `handle_refresh_certification` (line 508) — replace `await handle_screen_certification(canonical_run_id)` with `await _run_screen_certification(db, screen, workflow_run_id, update_screen_status=False)`.
-
-**Remove line 491** (`screen.status = "COMPLETED"`) — this is the band-aid that papered over the B2 violation. With `update_screen_status=False`, the status never changes.
-
-**Depends on:** F4
-
----
-
-### F6 — Fix `_run_source_bias` to Preserve Original Screen Bias
-
-**Priority:** CRITICAL
-**Files:** `backend/app/services/ist/content_extraction.py` (lines 205–213)
-
-**Problem:** `_run_source_bias` unconditionally writes `screen.source_bias = bias_summary.model_dump_json()`. During refresh, this permanently overwrites the original screen's bias with the delta content's bias.
-
-**Fix:** Add a `target_refresh` parameter:
-
-```python
-async def _run_source_bias(
-    db,
-    screen: ISTScreen,
-    workflow_run_id: int,
-    *,
-    update_screen_status: bool = True,
-    target_refresh: Optional["ISTScreenRefresh"] = None,  # NEW
-) -> dict:
-    # ... existing Claude call ...
-
-    bias_summary = SourceBiasSummary(
-        rating=result.rating,
-        notes=result.notes,
-        sourceCredibility=result.source_credibility,
-        potentialBlindSpots=result.potential_blind_spots,
-    )
-
-    if target_refresh is not None:
-        # Write to refresh record, not the parent screen
-        target_refresh.new_source_bias = bias_summary.model_dump_json()
-    else:
-        screen.source_bias = bias_summary.model_dump_json()
-
-    screen.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    return {"biasRating": result.rating}
-```
-
-**Fix — Update the refresh caller** in `backend/app/services/ist/refresh.py` (`handle_delta_bias_assessment`, ~line 159):
-
-```python
-# Pass the refresh object so bias is written there, not to the parent screen
-await _run_source_bias(
-    db, screen, workflow_run_id,
-    update_screen_status=False,
-    target_refresh=refresh,
-)
-```
-
-**Depends on:** F1 (needs `new_source_bias` column)
-
----
-
-### F7 — Fix `locals()` Sentinel Pattern in Refresh Handlers
+## F5 — Fix N+1 Query in `handle_overlap_matrix`
 
 **Priority:** HIGH
-**Files:** `backend/app/services/ist/refresh.py` (lines 141–143, 169–171, 211–213, 251–254, 500–502)
+**File:** `backend/app/services/ist/synthesis.py`, lines 132–134
+**Current behavior:** Per-candidate DB query for bottleneck name inside the loop.
 
-**Problem:** All refresh handlers use `if "refresh" in locals()` in except blocks, which is fragile and can leave refresh records stuck in PENDING if the exception occurs before `refresh` is assigned.
-
-**Fix:** In every handler, declare sentinels at the top:
-
-```python
-refresh = None
-screen = None
-try:
-    refresh = _get_refresh_by_run(db, workflow_run_id)
-    screen = _get_refresh_screen(db, refresh)
-    # ... rest of handler ...
-except Exception as exc:
-    if refresh is not None:
-        _mark_refresh_failed(db, refresh, screen, exc)
-    raise
-finally:
-    db.close()
-```
-
-Apply to all 6 refresh handlers: `handle_delta_extraction`, `handle_delta_bias_assessment`, `handle_delta_sufficiency_gate`, `handle_impact_assessment`, `handle_selective_reanalysis`, `handle_conditional_resynthesis`, `handle_refresh_certification`.
-
-**Depends on:** Nothing
-
----
-
-### F8 — Add Logging to Refresh and Synthesis Services
-
-**Priority:** HIGH
-**Files:**
-- `backend/app/services/ist/refresh.py`
-- `backend/app/services/ist/synthesis.py`
-
-**Problem:** Both files lack `import logging` and a module-level logger, unlike all other service files.
-
-**Fix:** Add to both files at the top (after existing imports):
+**Fix:** Batch pre-fetch all bottleneck IDs before the loop:
 
 ```python
-import logging
-logger = logging.getLogger(__name__)
-```
+# Before the candidate loop (after line 117):
+all_bn_ids = {c.bottleneck_id for c in candidates if c.bottleneck_id}
+bn_map = {}
+if all_bn_ids:
+    bns = db.query(ISTBottleneck).filter(ISTBottleneck.id.in_(all_bn_ids)).all()
+    bn_map = {bn.id: bn.name for bn in bns}
 
-Add `logger.info(...)` at handler entry and `logger.warning(...)` at error-skipping branches.
-
-**Depends on:** Nothing
-
----
-
-## Phase 3: API Layer Fixes (F9–F11)
-
-### F9 — Fix Variable Shadowing in `create_synthesis`
-
-**Priority:** CRITICAL
-**Files:** `backend/app/routers/ist_synthesis.py` (line 169)
-
-**Problem:** The outer `themes: set[str]` (line 111) is overwritten by `themes = extraction.get("themes")` (line 169) inside the source-creation loop. The accumulated set is destroyed.
-
-**Fix:** Rename the inner variable on line 169:
-
-```python
-        # Line 168-171: change from:
-        if not primary_theme and isinstance(extraction, dict):
-            themes = extraction.get("themes")
-            if isinstance(themes, list) and themes:
-                primary_theme = themes[0]
-
-        # To:
-        if not primary_theme and isinstance(extraction, dict):
-            raw_themes = extraction.get("themes")
-            if isinstance(raw_themes, list) and raw_themes:
-                primary_theme = raw_themes[0]
+# Replace lines 132-134 with:
+bottleneck_name = bn_map.get(cand.bottleneck_id) if cand.bottleneck_id else None
 ```
 
 **Depends on:** Nothing
 
 ---
 
-### F10 — Add Rate Limiter to Refresh Endpoint
+## F6 — Refine `SynthesisReport.tsx` Metadata Display
 
-**Priority:** HIGH
-**Files:** `backend/app/routers/ist.py` (line 432)
+**Priority:** REFINEMENT
+**File:** `frontend/components/ist/synthesis/SynthesisReport.tsx` (30 lines)
+**Current behavior:** Markdown body already renders correctly via `ReactMarkdown` + `remarkGfm` (Codex implemented this). However, the metadata block still uses raw `JSON.stringify` in a `<pre>` tag, which is inconsistent with the polished report body.
 
-**Problem:** `POST /screens/{screen_id}/refresh` creates a workflow run and triggers Claude API calls but has no rate limiter, unlike `create_screen` and `create_synthesis` which both have `@limiter.limit("5/hour")`.
-
-**Fix:** Add the decorator and `Request` parameter:
-
-```python
-@router.post("/screens/{screen_id}/refresh", status_code=201)
-@limiter.limit("5/hour")
-async def create_screen_refresh(
-    request: Request,  # ADD THIS
-    screen_id: int,
-    data: ISTScreenRefreshCreate,
-    db: Session = Depends(get_db),
-):
-```
-
-Ensure `from starlette.requests import Request` is imported (it likely already is).
-
-**Depends on:** Nothing
-
----
-
-### F11 — Fix `/sources` and `/equities` 404 Behavior + Conftest Limiter Reset
-
-**Priority:** HIGH
-**Files:**
-- `backend/app/routers/ist_synthesis.py` (lines 328–350, 377–405)
-- `backend/tests/conftest.py`
-
-**Problem:**
-1. `GET /syntheses/{id}/sources` and `GET /syntheses/{id}/equities` return HTTP 200 with empty list for non-existent synthesis IDs. Every other sub-resource endpoint correctly returns 404.
-2. The test conftest doesn't reset the `ist_synthesis` router's rate limiter, which will cause flaky 429s as tests grow.
-
-**Fix — Add existence check to both endpoints:**
-
-```python
-# At the top of get_synthesis_sources and get_synthesis_equities:
-synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
-if not synthesis:
-    raise HTTPException(
-        status_code=404,
-        detail=_error("SYNTHESIS_NOT_FOUND", f"No synthesis with id {synthesis_id}"),
-    )
-```
-
-**Fix — Update conftest:**
-
-```python
-from app.routers import ist as ist_router_mod, workflows as wf_router_mod, ist_synthesis as ist_synth_mod
-for mod in [ist_router_mod, wf_router_mod, ist_synth_mod]:
-    if hasattr(mod, "limiter"):
-        try:
-            mod.limiter.reset()
-        except Exception:
-            pass
-```
-
-**Depends on:** Nothing
-
----
-
-## Phase 4: Frontend Fixes (F12–F16)
-
-### F12 — Gate Refresh Panels on Refresh Count
-
-**Priority:** CRITICAL
-**Files:** `frontend/app/screens/[id]/page.tsx` (lines 750–762)
-
-**Problem:** `RefreshHistory` and `RefreshDelta` render unconditionally on every screen detail page, showing empty panels with "No refresh operations yet" even for screens that have never been refreshed.
-
-**Fix:** Wrap the grid in a conditional:
+**Fix:** Replace the metadata `<pre>` block (lines 18–22) with structured display. Keep the existing `ReactMarkdown` rendering for the report body:
 
 ```tsx
-{/* Refresh History - only show if screen has been refreshed */}
-{(refreshes.length > 0 || (screen && screen.refreshCount > 0)) && (
-  <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-    <RefreshHistory
-      refreshes={refreshes}
-      selectedRefreshId={selectedRefreshId}
-      onSelectRefresh={setSelectedRefreshId}
-    />
-    <RefreshDelta
-      detail={selectedRefresh}
-      claims={selectedRefreshClaims}
-      loading={refreshDetailLoading}
-      error={refreshDetailError}
-    />
+{metadata && (
+  <div className="flex items-center gap-3 text-xs text-text-secondary">
+    {metadata.equityCount != null && <span>{String(metadata.equityCount)} equities analyzed</span>}
+    {metadata.tierBreakdown && (
+      <span>
+        T1: {String((metadata.tierBreakdown as Record<string, number>).tier1 ?? 0)} ·
+        T2: {String((metadata.tierBreakdown as Record<string, number>).tier2 ?? 0)} ·
+        T3: {String((metadata.tierBreakdown as Record<string, number>).tier3 ?? 0)}
+      </span>
+    )}
   </div>
 )}
 ```
 
-**Depends on:** Nothing
-
----
-
-### F13 — Fix Synthesis Detail Page Loading Pattern
-
-**Priority:** CRITICAL
-**Files:** `frontend/app/screens/syntheses/[id]/page.tsx` (lines 46–62)
-
-**Problem:** Three sequential `await` calls where workflow + equities could be parallel. Equities fetched unconditionally for in-progress syntheses (guaranteed empty/error).
-
-**Fix:** Replace the `load` function body:
-
-```typescript
-const load = useCallback(async () => {
-  if (Number.isNaN(synthesisId)) return;
-  setLoading(true);
-  setError(null);
-  try {
-    const detail = await getSynthesis(synthesisId);
-    setSynthesis(detail);
-
-    const [wf, eq] = await Promise.all([
-      getWorkflow(detail.workflowRunId),
-      detail.status === "COMPLETED"
-        ? getSynthesisEquities(detail.id)
-        : Promise.resolve({ equities: [] }),
-    ]);
-    setWorkflow(wf);
-    setEquities(eq.equities);
-  } catch (err) {
-    setError(err instanceof Error ? err.message : "Failed to load synthesis");
-  } finally {
-    setLoading(false);
-  }
-}, [synthesisId]);
-```
+**Note:** Do NOT replace the `ReactMarkdown` rendering — it is already correct. Only change the metadata section above it.
 
 **Depends on:** Nothing
 
 ---
 
-### F14 — Add Idempotency Key to Synthesis Creation
+## F7 — Fix `SynthesisHandoff.tsx` Raw JSON
 
-**Priority:** CRITICAL
-**Files:** `frontend/app/screens/syntheses/new/page.tsx` (lines 46–50)
+**Priority:** HIGH
+**File:** `frontend/components/ist/synthesis/SynthesisHandoff.tsx` (18 lines)
+**Current behavior:** `JSON.stringify(handoff, null, 2)` in a `<pre>` tag.
 
-**Problem:** The `createSynthesis` call does not include `idempotencyKey`, silently dropping the duplicate-prevention protection mandated by Resolution C2.
+**Fix:** Replace with a structured card layout matching the existing `HandoffPanel.tsx` pattern:
 
-**Fix:**
+```tsx
+"use client";
 
-```typescript
-async function onSubmit(e: React.FormEvent) {
-  e.preventDefault();
-  if (!canSubmit) return;
-  setSubmitting(true);
-  setError(null);
-  try {
-    const idempotencyKey =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `synth-${Date.now()}`;
-    const created = await createSynthesis({
-      name: name.trim(),
-      screenIds: selectedIds,
-      autoAdvance,
-      idempotencyKey,
-    });
-    await advanceWorkflow(created.workflowRunId);
-    router.push(`/screens/syntheses/${created.id}`);
-  } catch (err) {
-    setError(err instanceof Error ? err.message : "Failed to create synthesis");
-    setSubmitting(false);
+interface HandoffCandidate {
+  ticker: string;
+  companyName: string;
+  tier: number;
+  conviction: string;
+  sourceScreenCount: number;
+}
+
+interface SynthesisHandoffProps {
+  handoff: Record<string, unknown> | null;
+}
+
+export default function SynthesisHandoff({ handoff }: SynthesisHandoffProps) {
+  if (!handoff) {
+    return <p className="text-sm text-text-secondary">HFRT handoff not generated yet.</p>;
   }
+
+  const candidates = (handoff.tier1Candidates || []) as HandoffCandidate[];
+  const tier1Count = (handoff.tier1Count as number) || 0;
+
+  if (!candidates.length) {
+    return <p className="text-sm text-text-secondary">No Tier 1 candidates for HFRT handoff.</p>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-text-secondary">
+        {tier1Count} Tier 1 candidate{tier1Count !== 1 ? "s" : ""} ready for HFRT research
+      </p>
+      <div className="overflow-x-auto rounded-lg border border-border">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-white/5">
+            <tr>
+              <th className="px-3 py-2">Ticker</th>
+              <th className="px-3 py-2">Company</th>
+              <th className="px-3 py-2">Conviction</th>
+              <th className="px-3 py-2">Sources</th>
+            </tr>
+          </thead>
+          <tbody>
+            {candidates.map((c) => (
+              <tr key={c.ticker} className="border-t border-border">
+                <td className="px-3 py-2 font-mono font-medium text-primary">{c.ticker}</td>
+                <td className="px-3 py-2 text-text-primary">{c.companyName}</td>
+                <td className="px-3 py-2">
+                  <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
+                    c.conviction === "HIGH" ? "bg-green-500/20 text-green-400" :
+                    c.conviction === "MEDIUM" ? "bg-yellow-500/20 text-yellow-400" :
+                    "bg-red-500/20 text-red-400"
+                  }`}>
+                    {c.conviction}
+                  </span>
+                </td>
+                <td className="px-3 py-2 text-text-secondary">{c.sourceScreenCount} screen{c.sourceScreenCount !== 1 ? "s" : ""}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }
 ```
 
+**Note:** Tab labels (`TAB_LABELS` map + `{TAB_LABELS[t]}` usage) are already implemented in `frontend/app/screens/syntheses/[id]/page.tsx` (lines 33–41, 214). No action needed.
+
 **Depends on:** Nothing
 
 ---
 
-### F15 — Fix Synthesis Tab Labels
+## F8 — Fix Dialectic Tab Raw JSON Rendering
 
 **Priority:** HIGH
-**Files:** `frontend/app/screens/syntheses/[id]/page.tsx` (lines 176–196)
+**File:** `frontend/app/screens/syntheses/[id]/page.tsx`, lines 250–252
+**Current behavior:** The dialectic tab renders `JSON.stringify(dialecticContent, null, 2)` in a `<pre>` block. Even after F4 creates the SYNTHESIS row, users will see raw JSON like `{"narrative": "...", "key_points": [...]}` instead of formatted content.
 
-**Problem:** Tab labels render raw enum strings like "tier-changes" and "interactions" instead of proper display names.
+**Fix:** Replace the dialectic `<pre>` block (lines 250–252) with a structured renderer that parses the dialectic payload and displays narrative + key points:
 
-**Fix:** Add a label map and use it in the render:
+```tsx
+{tab === "dialectic" && (
+  <div className="space-y-3">
+    <div className="flex items-center gap-2">
+      {(["OPTIMIST", "PESSIMIST", "SYNTHESIS"] as const).map((side) => (
+        <button
+          key={side}
+          onClick={() => setDialecticSide(side)}
+          className={cn(
+            "px-3 py-1.5 text-xs rounded-full",
+            dialecticSide === side ? "bg-primary/20 text-primary" : "bg-white/10 text-text-secondary"
+          )}
+        >
+          {side}
+        </button>
+      ))}
+    </div>
+    {dialecticContent ? (
+      <div className="space-y-4">
+        {(dialecticContent as Record<string, unknown>).narrative && (
+          <MarkdownNarrative content={String((dialecticContent as Record<string, unknown>).narrative)} />
+        )}
+        {Array.isArray((dialecticContent as Record<string, unknown>).key_points) && (
+          <div className="space-y-1.5">
+            <h4 className="text-xs font-semibold text-text-secondary uppercase tracking-wide">Key Points</h4>
+            <ul className="space-y-1 text-sm text-text-primary">
+              {((dialecticContent as Record<string, unknown>).key_points as string[]).map((pt, i) => (
+                <li key={i} className="flex gap-2">
+                  <span className="text-primary mt-0.5">-</span>
+                  <span>{pt}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    ) : (
+      <p className="text-sm text-text-secondary">No dialectic content available for this side.</p>
+    )}
+  </div>
+)}
+```
 
+This requires importing `MarkdownNarrative` at the top of the file:
 ```typescript
-const TAB_LABELS: Record<Tab, string> = {
-  report: "Report",
-  overlap: "Overlap Matrix",
-  interactions: "Thesis Interactions",
-  "tier-changes": "Tier Changes",
-  equities: "Equities",
-  dialectic: "Dialectic",
-  handoff: "HFRT Handoff",
-};
-
-// In the JSX, replace {t} with {TAB_LABELS[t]}:
-<button
-  key={t}
-  onClick={() => setTab(t)}
-  className={cn(
-    "px-3 py-2.5 text-sm whitespace-nowrap",
-    tab === t ? "text-primary border-b-2 border-primary" : "text-text-secondary hover:text-text-primary"
-  )}
->
-  {TAB_LABELS[t]}
-</button>
+import MarkdownNarrative from "@/components/MarkdownNarrative";
 ```
 
-**Depends on:** Nothing
+**Note:** The dialectic payload shape (`{ narrative: string, key_points: string[] }`) is defined by `_DialecticPayload` in the backend (F4). If the payload shape differs, adjust field names accordingly.
 
----
-
-### F16 — Fix Markdown Rendering in `SynthesisReport`
-
-**Priority:** HIGH
-**Files:** `frontend/components/ist/synthesis/SynthesisReport.tsx`
-
-**Problem:** Report markdown is rendered as plain text. Raw `##`, `**`, `-` characters are visible to users. The plan says to "reuse `InvestmentThesisReport.tsx` pattern."
-
-**Fix:** Find the markdown rendering approach used in `InvestmentThesisReport.tsx` (likely `react-markdown` or `marked`) and apply the same pattern. Replace:
-
-```tsx
-<article className="prose prose-invert max-w-none text-sm whitespace-pre-wrap">
-  {report}
-</article>
-```
-
-With the same markdown renderer used in `InvestmentThesisReport.tsx`. If that component uses `react-markdown`:
-
-```tsx
-import ReactMarkdown from "react-markdown";
-
-<article className="prose prose-invert max-w-none text-sm">
-  <ReactMarkdown>{report}</ReactMarkdown>
-</article>
-```
-
-If it uses `dangerouslySetInnerHTML` with `marked`, follow that same pattern. Match what already exists in the codebase.
-
-**Depends on:** Nothing
+**Depends on:** F4 (needs SYNTHESIS dialectic row to exist)
 
 ---
 
 ## Dependency Graph
 
 ```
-F1 ──→ F2
 F1 ──→ F3
-F1 ──→ F6
-F4 ──→ F5
+F2 ──→ F3
+F1 + F2 + F3 ──→ F4
+F4 ──→ F8 (dialectic rendering needs SYNTHESIS row from F4)
 
-All others are independent.
+F5, F6, F7 are independent of everything.
 ```
 
 **Recommended execution order:**
 
 ```
-Batch 1 (parallel):  F1, F4, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16
-Batch 2 (after F1):  F2, F3, F6
-Batch 3 (after F4):  F5
+Batch 1 (parallel):  F1, F2, F5, F6, F7
+Batch 2 (after F1+F2): F3
+Batch 3 (after F3):    F4, F8
 ```
-
----
-
-## Out of Scope (Deferred to Future Pass)
-
-The following were identified in the review but are intentionally deferred. They do not block correctness.
-
-1. **Synthesis Claude stubs** — `thesis_interactions`, `combined_bottleneck_analysis`, `cross_screen_effects`, `synthesis_dialectic_optimist`, `synthesis_dialectic_pessimist`, `synthesis_final` all use hardcoded heuristics instead of Claude calls. These are functionally incomplete but architecturally wired correctly. Claude integration should be added in a dedicated pass after the critical fixes land, to avoid conflating structural fixes with prompt engineering.
-
-2. **N+1 query in `handle_overlap_matrix`** — Bottleneck names fetched inside a loop. Fix with batch pre-fetch. Low urgency.
-
-3. **RefreshModal ARIA/focus trap** — Accessibility compliance. Should be addressed but not blocking.
-
-4. **`SynthesisListItem` missing `isCertified`** — Frontend type missing certification fields. Minor.
-
-5. **`OverlapMatrix` shows screen IDs not names** — Missing `screenName` in `OverlapAppearance` type.
-
-6. **`SynthesisHandoff` renders raw JSON** — Should reuse `HandoffPanel` pattern.
-
-7. **`update_screen_status` default** — Currently defaults to `True`; should default to `False` for safety. Addressed implicitly in F4/F5/F6 for the new `_run_*` functions, but the existing `_run_content_extraction`, `_run_bottleneck_mapping`, etc. still have `True` as default. Requires a coordinated change across all callers.
-
-8. **Partial unique index for idempotency_key** — Add `WHERE idempotency_key IS NOT NULL` for production correctness. Works on SQLite and PostgreSQL as-is; only matters for MySQL.
-
-9. **`useWorkflowSSE` stale closure reconnect** — Pre-existing issue. `currentStep` in dependency array causes SSE reconnect on every step transition.
 
 ---
 
 ## Verification
 
-After all fixes are applied, run:
+After all fixes are applied:
 
+1. **Delete existing syntheses** so they can be re-run with real Claude calls. Use the UI or API to delete all syntheses for the target screens. Do NOT assume ID=1 — query the list first:
 ```bash
-# Backend
-cd backend
-source venv/Scripts/activate
-alembic upgrade head
-pytest tests/integration/test_ist_endpoints.py tests/integration/test_ist_extension_endpoints.py tests/integration/test_dialectic_endpoints.py tests/integration/test_final_synthesis_endpoints.py -q
-
-# Frontend
-cd ../frontend
-npm run build
+# List existing syntheses to find the right ID:
+curl http://127.0.0.1:8000/api/ist/syntheses/
+# Then delete the relevant one:
+curl -X DELETE http://127.0.0.1:8000/api/ist/syntheses/<ID>
 ```
 
-Both must pass cleanly.
+2. **Create a new synthesis** from the UI (select 2+ completed screens)
+
+3. **Verify in the backend logs:**
+   - `httpx: HTTP Request: POST https://api.anthropic.com/v1/messages` appears for steps: `thesis_interactions`, `combined_bottleneck_analysis`, `cross_screen_effects`, `re_tiering`, `synthesis_dialectic_optimist`, `synthesis_dialectic_pessimist`, `synthesis_final`
+   - `Claude API tokens` cumulative count increases substantially (expect 50K–150K tokens total)
+   - Completion time is measured in minutes, not milliseconds
+
+4. **Verify in the frontend:**
+   - **Report tab:** Rendered markdown with proper headers, paragraphs, and styled tables (not raw `#` and `|`). Metadata shows structured counts (not raw JSON).
+   - **Thesis Interactions tab:** Each pair shows a substantive rationale (not "Theme overlap and tier alignment analysis")
+   - **Tier Changes tab:** At least some tickers show tier adjustments with cited cross-screen evidence
+   - **Dialectic tab:** SYNTHESIS view loads without 404. Displays narrative paragraphs + key points list (not raw JSON in a `<pre>` block). OPTIMIST and PESSIMIST sides also render as formatted content.
+   - **HFRT Handoff tab:** Structured table with ticker, company, conviction, source count (not raw JSON)
+   - **Tab labels:** Already verified as working ("Overlap Matrix", "Thesis Interactions", etc.)
+
+5. **Run backend tests:**
+```bash
+# From the backend directory, activate venv appropriate to your shell:
+# Bash: source venv/Scripts/activate
+# PowerShell: .\venv\Scripts\Activate.ps1
+pytest tests/integration/test_ist_extension_endpoints.py -q
+pytest tests/integration/test_final_synthesis_endpoints.py -q
+```
+
+6. **New test coverage required for F1–F4:**
+   Add or extend integration tests that verify:
+   - `POST /api/ist/syntheses/` creates a synthesis and triggers the workflow
+   - After workflow completion, `GET /api/ist/syntheses/<id>` returns non-empty `thesisInteractions`, `combinedBrief`, `tierChanges`, and `combinedReport` fields
+   - `GET /api/ist/syntheses/<id>/dialectic/SYNTHESIS` returns 200 (not 404) with `content` containing `narrative` and `key_points`
+   - `GET /api/ist/syntheses/<id>/equities` returns equities where at least one has a non-generic `crossScreenRationale` (not "No cross-screen adjustment")
+   - Output payload shapes match the Pydantic models defined in F1–F3
+
+---
+
+## CC Resolution of CX Review Comments
+
+Date: 2026-02-22
+Reviewer: Claude Code (CC)
+Scope: Resolution of all 7 Codex review findings
+
+| # | Finding | Severity | Verdict | Action Taken |
+|---|---------|----------|---------|-------------|
+| 1 | `call_claude_raw` signature mismatch | HIGH | **Valid** | Removed `workflow_run_id` from reference pattern (line 44) and F4 snippet |
+| 2 | Verification under-scoped | HIGH | **Valid** | Expanded verification section with test coverage requirements for F1-F4 output shapes, SYNTHESIS row creation, and payload contracts |
+| 3 | N+1 queries in F1/F2 | MEDIUM | **Valid** | Added batch preload pattern to both F1 (screen_map) and F2 (bn_screen_map) |
+| 4 | Progress math incorrect | MEDIUM | **Valid** | Fixed denominator from `len(sources) ** 2` to `n * (n - 1) // 2` with `pair_idx` counter |
+| 5 | F6/F7 claims stale | MEDIUM | **Partially valid** | F6 reclassified from CRITICAL to REFINEMENT (markdown rendering already works via `ReactMarkdown`; only metadata display needs fixing). Tab labels confirmed already implemented — removed from F7 scope. Handoff raw JSON confirmed still present — kept in F7. |
+| 6 | Dialectic rendering UX gap | MEDIUM | **Valid** | Added new F8 — dialectic tab narrative + key points rendering using `MarkdownNarrative` |
+| 7 | Verification fragility | LOW | **Valid** | Replaced hardcoded `syntheses/1` with query-first approach; noted both bash and PowerShell venv activation |
