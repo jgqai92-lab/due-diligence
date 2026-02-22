@@ -48,8 +48,12 @@ def client(db):
 
     # Reset all rate limiter storage between tests to prevent cross-test pollution
     # Each router may have its own Limiter instance with in-memory storage
-    from app.routers import ist as ist_router_mod, workflows as wf_router_mod
-    for mod in [ist_router_mod, wf_router_mod]:
+    from app.routers import (
+        ist as ist_router_mod,
+        ist_synthesis as ist_synth_router_mod,
+        workflows as wf_router_mod,
+    )
+    for mod in [ist_router_mod, wf_router_mod, ist_synth_router_mod]:
         if hasattr(mod, "limiter"):
             try:
                 mod.limiter.reset()

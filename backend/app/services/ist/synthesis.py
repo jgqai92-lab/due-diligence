@@ -1,6 +1,7 @@
 """IST synthesis workflow: cross-screen meta-analysis."""
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,6 +16,8 @@ from app.models.ist_synthesis import (
     ISTSynthesisSource,
 )
 from app.services.workflow_engine import emit_sse_event, register_step
+
+logger = logging.getLogger(__name__)
 
 IST_SYNTHESIS_WORKFLOW_STEPS = [
     {"step_name": "screen_ingestion", "phase": 1, "phase_name": "Screen Ingestion", "step_order": 1, "depends_on": [], "model": "opus"},
@@ -61,6 +64,7 @@ def _get_synthesis_by_run(db, workflow_run_id: int) -> ISTSynthesis:
 async def handle_screen_ingestion(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis screen_ingestion", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
         synthesis.status = "INGESTING"
         synthesis.updated_at = datetime.now(timezone.utc)
@@ -95,6 +99,7 @@ async def handle_screen_ingestion(workflow_run_id: int) -> dict | None:
 async def handle_overlap_matrix(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis overlap_matrix", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
 
         sources = (
@@ -153,6 +158,7 @@ async def handle_overlap_matrix(workflow_run_id: int) -> dict | None:
 async def handle_thesis_interactions(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis thesis_interactions", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
 
         sources = (
@@ -202,6 +208,7 @@ async def handle_thesis_interactions(workflow_run_id: int) -> dict | None:
 async def handle_synthesis_readiness_gate(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis_readiness_gate", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
 
         overlap = _load_json(synthesis.overlap_matrix, [])
@@ -226,6 +233,7 @@ async def handle_synthesis_readiness_gate(workflow_run_id: int) -> dict | None:
 async def handle_combined_bottleneck_analysis(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis combined_bottleneck_analysis", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
         synthesis.status = "ANALYZING"
 
@@ -266,6 +274,7 @@ async def handle_combined_bottleneck_analysis(workflow_run_id: int) -> dict | No
 async def handle_cross_screen_effects(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis cross_screen_effects", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
 
         interactions = _load_json(synthesis.thesis_interactions, [])
@@ -293,6 +302,7 @@ async def handle_cross_screen_effects(workflow_run_id: int) -> dict | None:
 async def handle_re_tiering(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis re_tiering", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
 
         overlap = _load_json(synthesis.overlap_matrix, [])
@@ -375,6 +385,7 @@ async def handle_re_tiering(workflow_run_id: int) -> dict | None:
 async def handle_synthesis_dialectic_optimist(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis_dialectic_optimist", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
         synthesis.status = "DIALECTIC"
 
@@ -407,6 +418,7 @@ async def handle_synthesis_dialectic_optimist(workflow_run_id: int) -> dict | No
 async def handle_synthesis_dialectic_pessimist(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis_dialectic_pessimist", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
 
         db.query(ISTSynthesisDialectic).filter(
@@ -438,6 +450,7 @@ async def handle_synthesis_dialectic_pessimist(workflow_run_id: int) -> dict | N
 async def handle_synthesis_final(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
     try:
+        logger.info("Starting synthesis_final", extra={"workflow_run_id": workflow_run_id})
         synthesis = _get_synthesis_by_run(db, workflow_run_id)
         synthesis.status = "SYNTHESIZING"
 

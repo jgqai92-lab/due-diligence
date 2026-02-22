@@ -39,6 +39,11 @@ class ISTScreenRefresh(Base):
     delta_content = Column(Text, nullable=False)
     impact_assessment = Column(Text, nullable=True)
     steps_reexecuted = Column(Text, nullable=True)
+    new_claims_count = Column(Integer, nullable=False, default=0)
+    new_claims = Column(Text, nullable=True)
+    new_source_bias = Column(Text, nullable=True)
+    tier_changes = Column(Text, nullable=True)
+    tier_change_count = Column(Integer, nullable=False, default=0)
     refresh_notes = Column(Text, nullable=True)
     idempotency_key = Column(Text, nullable=True)
 

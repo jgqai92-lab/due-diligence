@@ -1,6 +1,7 @@
 """IST refresh workflow: incremental update of completed screens."""
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from app.database import SessionLocal
@@ -28,13 +29,13 @@ from app.services.ist.equity_identification import (
     _run_tier_classification,
 )
 from app.services.ist.final_synthesis import (
-    handle_catalyst_calendar,
-    handle_hfrt_handoff_generation,
-    handle_master_screen,
-    handle_report_generation,
-    handle_rotation_strategy,
-    handle_screen_certification,
-    handle_stress_tests,
+    _run_catalyst_calendar,
+    _run_hfrt_handoff_generation,
+    _run_master_screen,
+    _run_report_generation,
+    _run_rotation_strategy,
+    _run_screen_certification,
+    _run_stress_tests,
 )
 from app.services.ist.thematic_analysis import (
     _run_bottleneck_mapping,
@@ -42,6 +43,8 @@ from app.services.ist.thematic_analysis import (
     _run_external_validation,
 )
 from app.services.workflow_engine import register_step
+
+logger = logging.getLogger(__name__)
 
 
 IST_REFRESH_WORKFLOW_STEPS = [
@@ -97,6 +100,14 @@ def _mark_refresh_failed(
     screen: ISTScreen | None,
     exc: Exception,
 ) -> None:
+    logger.exception(
+        "IST refresh failed",
+        extra={
+            "refresh_id": refresh.id if refresh else None,
+            "screen_id": screen.id if screen else None,
+            "error": str(exc),
+        },
+    )
     now = datetime.now(timezone.utc)
     refresh.status = "FAILED"
     refresh.error_message = str(exc)[:1000]
@@ -112,7 +123,10 @@ def _mark_refresh_failed(
 @register_step("IST_REFRESH", "delta_extraction")
 async def handle_delta_extraction(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting delta_extraction", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
@@ -136,11 +150,35 @@ async def handle_delta_extraction(workflow_run_id: int) -> dict | None:
                 "deltaExtraction": result or {},
             },
         )
+
+        delta_claims = (
+            db.query(ISTClaim)
+            .filter(
+                ISTClaim.screen_id == screen.id,
+                ISTClaim.source_refresh_id == refresh.id,
+            )
+            .order_by(ISTClaim.id)
+            .all()
+        )
+        refresh.new_claims_count = len(delta_claims)
+        refresh.new_claims = json.dumps(
+            [
+                {
+                    "id": claim.id,
+                    "claimText": claim.claim_text,
+                    "sourceCitation": claim.source_citation,
+                    "quantitativeAnchor": claim.quantitative_anchor,
+                    "temporalMarker": claim.temporal_marker,
+                    "confidence": claim.confidence,
+                }
+                for claim in delta_claims
+            ]
+        )
         db.commit()
         return result
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
@@ -149,7 +187,10 @@ async def handle_delta_extraction(workflow_run_id: int) -> dict | None:
 @register_step("IST_REFRESH", "delta_bias_assessment")
 async def handle_delta_bias_assessment(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting delta_bias_assessment", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
@@ -161,13 +202,14 @@ async def handle_delta_bias_assessment(workflow_run_id: int) -> dict | None:
             db,
             workflow_run_id,
             raw_content=refresh.delta_content,
+            target_refresh=refresh,
         )
         _merge_refresh_notes(refresh, {"deltaBiasAssessment": result or {}})
         db.commit()
         return result
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
@@ -176,7 +218,10 @@ async def handle_delta_bias_assessment(workflow_run_id: int) -> dict | None:
 @register_step("IST_REFRESH", "delta_sufficiency_gate")
 async def handle_delta_sufficiency_gate(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting delta_sufficiency_gate", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
@@ -209,8 +254,8 @@ async def handle_delta_sufficiency_gate(workflow_run_id: int) -> dict | None:
             "deltaQuantAnchorCount": delta_quant_anchor_count,
         }
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
@@ -219,7 +264,10 @@ async def handle_delta_sufficiency_gate(workflow_run_id: int) -> dict | None:
 @register_step("IST_REFRESH", "impact_assessment")
 async def handle_impact_assessment(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting impact_assessment", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
@@ -249,8 +297,8 @@ async def handle_impact_assessment(workflow_run_id: int) -> dict | None:
         db.commit()
         return impact
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
@@ -259,7 +307,10 @@ async def handle_impact_assessment(workflow_run_id: int) -> dict | None:
 @register_step("IST_REFRESH", "selective_reanalysis")
 async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting selective_reanalysis", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
@@ -275,6 +326,13 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
             return bool(isinstance(step_data, dict) and step_data.get("needed"))
 
         steps_reexecuted: list[str] = []
+        pre_candidates = (
+            db.query(ISTEquityCandidate)
+            .filter(ISTEquityCandidate.screen_id == screen.id)
+            .order_by(ISTEquityCandidate.id)
+            .all()
+        )
+        previous_tiers = {c.ticker: c.tier for c in pre_candidates}
 
         claims = (
             db.query(ISTClaim)
@@ -401,12 +459,43 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
                 ]
             )
 
+        post_candidates = (
+            db.query(ISTEquityCandidate)
+            .filter(ISTEquityCandidate.screen_id == screen.id)
+            .order_by(ISTEquityCandidate.id)
+            .all()
+        )
+        tier_changes = []
+        for candidate in post_candidates:
+            old_tier = previous_tiers.get(candidate.ticker)
+            if old_tier is None or old_tier == candidate.tier:
+                continue
+            tier_changes.append(
+                {
+                    "ticker": candidate.ticker,
+                    "oldTier": old_tier,
+                    "newTier": candidate.tier,
+                    "rationale": "Tier changed after selective reanalysis",
+                }
+            )
+
+        refresh.tier_changes = json.dumps(tier_changes)
+        refresh.tier_change_count = len(tier_changes)
         refresh.steps_reexecuted = json.dumps(steps_reexecuted)
+        _merge_refresh_notes(
+            refresh,
+            {
+                "tierChanges": tier_changes,
+            },
+        )
         db.commit()
-        return {"stepsReexecuted": steps_reexecuted}
+        return {
+            "stepsReexecuted": steps_reexecuted,
+            "tierChangeCount": len(tier_changes),
+        }
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
@@ -415,7 +504,10 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
 @register_step("IST_REFRESH", "refresh_invariant_check")
 async def handle_refresh_invariant_check(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting refresh_invariant_check", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
@@ -444,8 +536,8 @@ async def handle_refresh_invariant_check(workflow_run_id: int) -> dict | None:
             "candidateCount": candidate_count,
         }
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
@@ -454,7 +546,10 @@ async def handle_refresh_invariant_check(workflow_run_id: int) -> dict | None:
 @register_step("IST_REFRESH", "conditional_resynthesis")
 async def handle_conditional_resynthesis(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting conditional_resynthesis", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
@@ -480,15 +575,37 @@ async def handle_conditional_resynthesis(workflow_run_id: int) -> dict | None:
             db.query(ISTMasterScreen).filter(ISTMasterScreen.screen_id == screen.id).delete()
             db.commit()
 
-            canonical_run_id = screen.workflow_run_id
-            await handle_master_screen(canonical_run_id)
-            await handle_rotation_strategy(canonical_run_id)
-            await handle_catalyst_calendar(canonical_run_id)
-            await handle_stress_tests(canonical_run_id)
-            await handle_report_generation(canonical_run_id)
+            await _run_master_screen(
+                db,
+                screen,
+                workflow_run_id,
+                update_screen_status=False,
+            )
+            await _run_rotation_strategy(
+                db,
+                screen,
+                workflow_run_id,
+                update_screen_status=False,
+            )
+            await _run_catalyst_calendar(
+                db,
+                screen,
+                workflow_run_id,
+                update_screen_status=False,
+            )
+            await _run_stress_tests(
+                db,
+                screen,
+                workflow_run_id,
+                update_screen_status=False,
+            )
+            await _run_report_generation(
+                db,
+                screen,
+                workflow_run_id,
+                update_screen_status=False,
+            )
 
-            # Keep screen lifecycle stable during refresh.
-            screen.status = "COMPLETED"
             screen.updated_at = datetime.now(timezone.utc)
             _merge_refresh_notes(refresh, {"resynthesis": "full"})
             db.commit()
@@ -498,8 +615,8 @@ async def handle_conditional_resynthesis(workflow_run_id: int) -> dict | None:
         db.commit()
         return {"resynthesized": False}
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
@@ -508,16 +625,28 @@ async def handle_conditional_resynthesis(workflow_run_id: int) -> dict | None:
 @register_step("IST_REFRESH", "refresh_certification")
 async def handle_refresh_certification(workflow_run_id: int) -> dict | None:
     db = SessionLocal()
+    refresh = None
+    screen = None
     try:
+        logger.info("Starting refresh_certification", extra={"workflow_run_id": workflow_run_id})
         refresh = _get_refresh_by_run(db, workflow_run_id)
         screen = _get_refresh_screen(db, refresh)
 
         refresh.status = "RE_SYNTHESIZING"
         db.commit()
 
-        canonical_run_id = screen.workflow_run_id
-        await handle_screen_certification(canonical_run_id)
-        await handle_hfrt_handoff_generation(canonical_run_id)
+        await _run_screen_certification(
+            db,
+            screen,
+            workflow_run_id,
+            update_screen_status=False,
+        )
+        await _run_hfrt_handoff_generation(
+            db,
+            screen,
+            workflow_run_id,
+            update_screen_status=False,
+        )
 
         now = datetime.now(timezone.utc)
         screen.status = "COMPLETED"
@@ -538,9 +667,8 @@ async def handle_refresh_certification(workflow_run_id: int) -> dict | None:
             "completedAt": now.isoformat(),
         }
     except Exception as exc:
-        if "refresh" in locals():
-            _mark_refresh_failed(db, refresh, screen if "screen" in locals() else None, exc)
+        if refresh is not None:
+            _mark_refresh_failed(db, refresh, screen, exc)
         raise
     finally:
         db.close()
-

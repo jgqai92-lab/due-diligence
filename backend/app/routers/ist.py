@@ -430,7 +430,9 @@ async def rerun_screen(screen_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/screens/{screen_id}/refresh", status_code=201)
+@limiter.limit("5/hour")
 async def create_screen_refresh(
+    request: Request,
     screen_id: int,
     data: ISTScreenRefreshCreate,
     db: Session = Depends(get_db),
@@ -614,6 +616,8 @@ def list_screen_refreshes(screen_id: int, db: Session = Depends(get_db)):
                 "status": refresh.status,
                 "contentType": refresh.content_type,
                 "deltaClaimCount": int(delta_claim_counts.get(refresh.id, 0)),
+                "newClaimsCount": int(refresh.new_claims_count or 0),
+                "tierChangeCount": int(refresh.tier_change_count or 0),
                 "stepsReexecuted": _deep_camel(_safe_json_parse(refresh.steps_reexecuted)),
                 "impactAssessment": _deep_camel(_safe_json_parse(refresh.impact_assessment)),
                 "errorMessage": refresh.error_message,
@@ -679,6 +683,11 @@ def get_screen_refresh_detail(
         "contentType": refresh.content_type,
         "deltaContent": refresh.delta_content,
         "deltaClaimCount": int(delta_claim_count or 0),
+        "newClaimsCount": int(refresh.new_claims_count or 0),
+        "newClaims": _deep_camel(_safe_json_parse(refresh.new_claims)),
+        "newSourceBias": _deep_camel(_safe_json_parse(refresh.new_source_bias)),
+        "tierChanges": _deep_camel(_safe_json_parse(refresh.tier_changes)),
+        "tierChangeCount": int(refresh.tier_change_count or 0),
         "stepsReexecuted": _deep_camel(_safe_json_parse(refresh.steps_reexecuted)),
         "impactAssessment": _deep_camel(_safe_json_parse(refresh.impact_assessment)),
         "refreshNotes": _deep_camel(_safe_json_parse(refresh.refresh_notes)),

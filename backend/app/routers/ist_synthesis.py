@@ -19,7 +19,20 @@ from app.models.ist_synthesis import (
     ISTSynthesisSource,
 )
 from app.models.workflow import WorkflowRun, WorkflowStep
-from app.schemas.ist import ISTSynthesisCreate
+from app.schemas.ist_synthesis import (
+    ISTSynthesisCreate,
+    ISTSynthesisCreateResponse,
+    SynthesisDetailResponse,
+    SynthesisDialecticResponse,
+    SynthesisEquitiesResponse,
+    SynthesisHandoffResponse,
+    SynthesisInteractionsResponse,
+    SynthesisListResponse,
+    SynthesisOverlapResponse,
+    SynthesisReportResponse,
+    SynthesisSourcesResponse,
+    SynthesisTierChangesResponse,
+)
 from app.services.ist.synthesis import IST_SYNTHESIS_WORKFLOW_STEPS
 from app.services.workflow_engine import cancel_workflow
 
@@ -40,7 +53,7 @@ def _safe_json(value: Optional[str], fallback):
         return fallback
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, response_model=ISTSynthesisCreateResponse)
 @limiter.limit("5/hour")
 def create_synthesis(
     request: Request,
@@ -166,9 +179,9 @@ def create_synthesis(
         if isinstance(brief, dict):
             primary_theme = brief.get("hypothesis")
         if not primary_theme and isinstance(extraction, dict):
-            themes = extraction.get("themes")
-            if isinstance(themes, list) and themes:
-                primary_theme = themes[0]
+            raw_themes = extraction.get("themes")
+            if isinstance(raw_themes, list) and raw_themes:
+                primary_theme = raw_themes[0]
 
         db.add(
             ISTSynthesisSource(
@@ -211,7 +224,7 @@ def create_synthesis(
     return response
 
 
-@router.get("")
+@router.get("", response_model=SynthesisListResponse)
 def list_syntheses(
     status: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
@@ -268,7 +281,7 @@ def list_syntheses(
     return {"syntheses": items, "total": total}
 
 
-@router.get("/{synthesis_id}")
+@router.get("/{synthesis_id}", response_model=SynthesisDetailResponse)
 def get_synthesis(synthesis_id: int, db: Session = Depends(get_db)):
     """Get synthesis detail."""
     synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
@@ -325,8 +338,14 @@ async def delete_synthesis(synthesis_id: int, db: Session = Depends(get_db)):
     return {"message": f"Synthesis {synthesis_id} deleted"}
 
 
-@router.get("/{synthesis_id}/sources")
+@router.get("/{synthesis_id}/sources", response_model=SynthesisSourcesResponse)
 def get_synthesis_sources(synthesis_id: int, db: Session = Depends(get_db)):
+    synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
+    if not synthesis:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("SYNTHESIS_NOT_FOUND", f"No synthesis with id {synthesis_id}"),
+        )
     rows = (
         db.query(ISTSynthesisSource)
         .filter(ISTSynthesisSource.synthesis_id == synthesis_id)
@@ -350,7 +369,7 @@ def get_synthesis_sources(synthesis_id: int, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/{synthesis_id}/overlap")
+@router.get("/{synthesis_id}/overlap", response_model=SynthesisOverlapResponse)
 def get_synthesis_overlap(synthesis_id: int, db: Session = Depends(get_db)):
     synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
     if not synthesis:
@@ -358,7 +377,7 @@ def get_synthesis_overlap(synthesis_id: int, db: Session = Depends(get_db)):
     return {"synthesisId": synthesis_id, "overlap": _safe_json(synthesis.overlap_matrix, [])}
 
 
-@router.get("/{synthesis_id}/interactions")
+@router.get("/{synthesis_id}/interactions", response_model=SynthesisInteractionsResponse)
 def get_synthesis_interactions(synthesis_id: int, db: Session = Depends(get_db)):
     synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
     if not synthesis:
@@ -366,7 +385,7 @@ def get_synthesis_interactions(synthesis_id: int, db: Session = Depends(get_db))
     return {"synthesisId": synthesis_id, "interactions": _safe_json(synthesis.thesis_interactions, [])}
 
 
-@router.get("/{synthesis_id}/tier-changes")
+@router.get("/{synthesis_id}/tier-changes", response_model=SynthesisTierChangesResponse)
 def get_synthesis_tier_changes(synthesis_id: int, db: Session = Depends(get_db)):
     synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
     if not synthesis:
@@ -374,8 +393,14 @@ def get_synthesis_tier_changes(synthesis_id: int, db: Session = Depends(get_db))
     return {"synthesisId": synthesis_id, "tierChanges": _safe_json(synthesis.tier_changes, [])}
 
 
-@router.get("/{synthesis_id}/equities")
+@router.get("/{synthesis_id}/equities", response_model=SynthesisEquitiesResponse)
 def get_synthesis_equities(synthesis_id: int, db: Session = Depends(get_db)):
+    synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
+    if not synthesis:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("SYNTHESIS_NOT_FOUND", f"No synthesis with id {synthesis_id}"),
+        )
     rows = (
         db.query(ISTSynthesisEquity)
         .filter(ISTSynthesisEquity.synthesis_id == synthesis_id)
@@ -405,7 +430,7 @@ def get_synthesis_equities(synthesis_id: int, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/{synthesis_id}/dialectic/{side}")
+@router.get("/{synthesis_id}/dialectic/{side}", response_model=SynthesisDialecticResponse)
 def get_synthesis_dialectic(synthesis_id: int, side: str, db: Session = Depends(get_db)):
     normalized = side.upper()
     if normalized not in ("OPTIMIST", "PESSIMIST", "SYNTHESIS"):
@@ -436,7 +461,7 @@ def get_synthesis_dialectic(synthesis_id: int, side: str, db: Session = Depends(
     }
 
 
-@router.get("/{synthesis_id}/report")
+@router.get("/{synthesis_id}/report", response_model=SynthesisReportResponse)
 def get_synthesis_report(synthesis_id: int, db: Session = Depends(get_db)):
     synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
     if not synthesis:
@@ -455,7 +480,7 @@ def get_synthesis_report(synthesis_id: int, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/{synthesis_id}/handoff")
+@router.get("/{synthesis_id}/handoff", response_model=SynthesisHandoffResponse)
 def get_synthesis_handoff(synthesis_id: int, db: Session = Depends(get_db)):
     synthesis = db.query(ISTSynthesis).filter(ISTSynthesis.id == synthesis_id).first()
     if not synthesis:

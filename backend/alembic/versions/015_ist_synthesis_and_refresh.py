@@ -241,6 +241,11 @@ def upgrade() -> None:
         sa.Column("delta_content", sa.Text(), nullable=False),
         sa.Column("impact_assessment", sa.Text(), nullable=True),
         sa.Column("steps_reexecuted", sa.Text(), nullable=True),
+        sa.Column("new_claims_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("new_claims", sa.Text(), nullable=True),
+        sa.Column("new_source_bias", sa.Text(), nullable=True),
+        sa.Column("tier_changes", sa.Text(), nullable=True),
+        sa.Column("tier_change_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("refresh_notes", sa.Text(), nullable=True),
         sa.Column("idempotency_key", sa.Text(), nullable=True),
         sa.Column("error_message", sa.Text(), nullable=True),
@@ -311,8 +316,10 @@ def upgrade() -> None:
         )
 
     op.execute(
-        "UPDATE ist_screens SET active_workflow_run_id = workflow_run_id "
-        "WHERE active_workflow_run_id IS NULL"
+        sa.text(
+            "UPDATE ist_screens SET active_workflow_run_id = workflow_run_id "
+            "WHERE active_workflow_run_id IS NULL AND workflow_run_id IS NOT NULL"
+        )
     )
 
     with op.batch_alter_table("ist_claims") as batch_op:

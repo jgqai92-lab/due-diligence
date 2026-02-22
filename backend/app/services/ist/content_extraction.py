@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -14,6 +14,9 @@ from app.services.ist.claude_client import call_claude
 from app.services.workflow_engine import emit_sse_event, register_step
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from app.models.ist_refresh import ISTScreenRefresh
 
 
 class ExtractedClaim(BaseModel):
@@ -180,6 +183,7 @@ async def _run_source_bias(
     workflow_run_id: int,
     *,
     raw_content: Optional[str] = None,
+    target_refresh: Optional["ISTScreenRefresh"] = None,
 ) -> dict | None:
     """Core source-bias logic reusable by IST and IST_REFRESH wrappers."""
     source_content = raw_content if raw_content is not None else screen.raw_content
@@ -208,7 +212,10 @@ async def _run_source_bias(
         sourceCredibility=result.source_credibility,
         potentialBlindSpots=result.potential_blind_spots,
     )
-    screen.source_bias = bias_summary.model_dump_json()
+    if target_refresh is not None:
+        target_refresh.new_source_bias = bias_summary.model_dump_json()
+    else:
+        screen.source_bias = bias_summary.model_dump_json()
     screen.updated_at = datetime.now(timezone.utc)
     db.commit()
 

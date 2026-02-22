@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.models.ist import (
@@ -563,137 +564,205 @@ def _run_invariant_checks(db, screen_id: int) -> list[dict]:
 # -- Registered workflow step handlers ----------------------------------------
 
 
-@register_step("IST", "master_screen")
-async def handle_master_screen(workflow_run_id: int) -> dict | None:
-    """Produce a ranked equity list with conviction scores via Claude.
-
-    Also runs invariant checks inline and stores compliance data.
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via Pydantic serialization.
-    """
-    db = SessionLocal()
-    try:
-        screen = (
-            db.query(ISTScreen)
-            .filter(ISTScreen.workflow_run_id == workflow_run_id)
-            .first()
-        )
-        if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        # Update screen status to SYNTHESIZING
+async def _run_master_screen(
+    db: Session,
+    screen: ISTScreen,
+    workflow_run_id: int,
+    *,
+    update_screen_status: bool = False,
+) -> dict | None:
+    """Core master-screen logic reusable by IST and IST_REFRESH."""
+    if update_screen_status:
         screen.status = "SYNTHESIZING"
         screen.updated_at = datetime.now(timezone.utc)
         db.commit()
 
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "master_screen",
-                "message": "Building master screen...",
-                "percent": 10,
-            },
-        )
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "master_screen",
+            "message": "Building master screen...",
+            "percent": 10,
+        },
+    )
 
-        # Build full data package (INV-AI-01)
-        data_package = _build_full_data_package(db, screen.id)
+    data_package = _build_full_data_package(db, screen.id)
 
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "master_screen",
-                "message": "Calling Claude for master screen ranking...",
-                "percent": 30,
-            },
-        )
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "master_screen",
+            "message": "Calling Claude for master screen ranking...",
+            "percent": 30,
+        },
+    )
 
-        user_prompt = (
-            f"{data_package}\n\n"
-            f"Produce a ranked equity screen from all the data above.\n"
-            f"Rank by conviction considering scarcity scores, tier classifications, "
-            f"and dialectic synthesis adjustments.\n"
-            f"Return JSON matching this schema: "
-            f"{MasterScreenResult.model_json_schema()}"
-        )
+    user_prompt = (
+        f"{data_package}\n\n"
+        f"Produce a ranked equity screen from all the data above.\n"
+        f"Rank by conviction considering scarcity scores, tier classifications, "
+        f"and dialectic synthesis adjustments.\n"
+        f"Return JSON matching this schema: "
+        f"{MasterScreenResult.model_json_schema()}"
+    )
 
-        result = await call_claude(
-            system_prompt=MASTER_SCREEN_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=MasterScreenResult,
-            max_tokens=8192,
-        )
+    result = await call_claude(
+        system_prompt=MASTER_SCREEN_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_model=MasterScreenResult,
+        max_tokens=8192,
+    )
 
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "master_screen",
-                "message": "Running invariant checks...",
-                "percent": 70,
-            },
-        )
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "master_screen",
+            "message": "Running invariant checks...",
+            "percent": 70,
+        },
+    )
 
-        # Run invariant checks inline
-        invariants = _run_invariant_checks(db, screen.id)
+    invariants = _run_invariant_checks(db, screen.id)
+    tier1_count = sum(1 for eq in result.ranked_equities if eq.tier == 1)
 
-        # Count tier 1 equities from the result
-        tier1_count = sum(1 for eq in result.ranked_equities if eq.tier == 1)
+    ranked_json = json.dumps([eq.model_dump() for eq in result.ranked_equities])
+    invariant_json = json.dumps(invariants)
 
-        # Store master screen (INV-BE-06: Pydantic serialization)
-        ranked_json = json.dumps([eq.model_dump() for eq in result.ranked_equities])
-        invariant_json = json.dumps(invariants)
+    master = ISTMasterScreen(
+        screen_id=screen.id,
+        ranked_equities=ranked_json,
+        invariant_compliance=invariant_json,
+        total_equities=len(result.ranked_equities),
+        tier1_count=tier1_count,
+    )
+    db.add(master)
 
-        master = ISTMasterScreen(
-            screen_id=screen.id,
-            ranked_equities=ranked_json,
-            invariant_compliance=invariant_json,
-            total_equities=len(result.ranked_equities),
-            tier1_count=tier1_count,
-        )
-        db.add(master)
-
-        # Sync master screen tier assignments back to ISTEquityCandidate rows.
-        # Phase 3 (tier_classification) sets initial tiers; Phase 5 (master_screen)
-        # may reclassify based on the full dialectic + synthesis context.
-        # Without this write-back, downstream consumers (Brief tab, HFRT handoff)
-        # that query ISTEquityCandidate.tier would see stale Phase 3 values.
-        for eq_result in result.ranked_equities:
-            cand = (
-                db.query(ISTEquityCandidate)
-                .filter(
-                    ISTEquityCandidate.screen_id == screen.id,
-                    ISTEquityCandidate.ticker == eq_result.ticker,
-                )
-                .first()
+    for eq_result in result.ranked_equities:
+        cand = (
+            db.query(ISTEquityCandidate)
+            .filter(
+                ISTEquityCandidate.screen_id == screen.id,
+                ISTEquityCandidate.ticker == eq_result.ticker,
             )
-            if cand and cand.tier != eq_result.tier:
-                cand.tier = eq_result.tier
+            .first()
+        )
+        if cand and cand.tier != eq_result.tier:
+            cand.tier = eq_result.tier
 
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "totalEquities": len(result.ranked_equities),
+        "tier1Count": tier1_count,
+        "invariantsPassed": sum(1 for inv in invariants if inv["status"] == "PASS"),
+        "invariantsFailed": sum(1 for inv in invariants if inv["status"] == "FAIL"),
+    }
+
+
+@register_step("IST", "master_screen")
+async def handle_master_screen(workflow_run_id: int) -> dict | None:
+    """Produce a ranked equity list with conviction scores via Claude."""
+    db = SessionLocal()
+    try:
+        screen = (
+            db.query(ISTScreen)
+            .filter(ISTScreen.workflow_run_id == workflow_run_id)
+            .first()
+        )
+        if not screen:
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        return await _run_master_screen(
+            db,
+            screen,
+            workflow_run_id,
+            update_screen_status=True,
+        )
+    finally:
+        db.close()
+
+
+async def _run_rotation_strategy(
+    db: Session,
+    screen: ISTScreen,
+    workflow_run_id: int,
+    *,
+    update_screen_status: bool = False,
+) -> dict | None:
+    """Core rotation-strategy logic reusable by IST and IST_REFRESH."""
+    if update_screen_status:
+        screen.status = "SYNTHESIZING"
         screen.updated_at = datetime.now(timezone.utc)
         db.commit()
 
-        return {
-            "totalEquities": len(result.ranked_equities),
-            "tier1Count": tier1_count,
-            "invariantsPassed": sum(1 for inv in invariants if inv["status"] == "PASS"),
-            "invariantsFailed": sum(1 for inv in invariants if inv["status"] == "FAIL"),
-        }
-    finally:
-        db.close()
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "rotation_strategy",
+            "message": "Designing rotation strategy...",
+            "percent": 10,
+        },
+    )
+
+    data_package = _build_full_data_package(db, screen.id)
+    master = (
+        db.query(ISTMasterScreen)
+        .filter(ISTMasterScreen.screen_id == screen.id)
+        .first()
+    )
+    master_text = ""
+    if master:
+        master_text = f"\n\n<master_screen>\n{master.ranked_equities}\n</master_screen>"
+
+    user_prompt = (
+        f"{data_package}{master_text}\n\n"
+        f"Design a phase-based rotation strategy for this investment screen.\n"
+        f"Include phase allocations, rotation triggers, and risk limits.\n"
+        f"Return JSON matching this schema: "
+        f"{RotationStrategyResult.model_json_schema()}"
+    )
+
+    result = await call_claude(
+        system_prompt=ROTATION_STRATEGY_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_model=RotationStrategyResult,
+        max_tokens=8192,
+    )
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "rotation_strategy",
+            "message": "Storing rotation strategy...",
+            "percent": 80,
+        },
+    )
+
+    rotation = ISTRotationStrategy(
+        screen_id=screen.id,
+        phase_allocations=json.dumps([pa.model_dump() for pa in result.phase_allocations]),
+        rotation_triggers=json.dumps([rt.model_dump() for rt in result.rotation_triggers]),
+        risk_limits=json.dumps([rl.model_dump() for rl in result.risk_limits]),
+    )
+    db.add(rotation)
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "phaseCount": len(result.phase_allocations),
+        "triggerCount": len(result.rotation_triggers),
+        "riskLimitCount": len(result.risk_limits),
+    }
 
 
 @register_step("IST", "rotation_strategy")
 async def handle_rotation_strategy(workflow_run_id: int) -> dict | None:
-    """Produce phase-based allocation with rotation triggers via Claude.
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via Pydantic serialization.
-    """
+    """Produce phase-based allocation with rotation triggers via Claude."""
     db = SessionLocal()
     try:
         screen = (
@@ -702,86 +771,92 @@ async def handle_rotation_strategy(workflow_run_id: int) -> dict | None:
             .first()
         )
         if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        await emit_sse_event(
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        return await _run_rotation_strategy(
+            db,
+            screen,
             workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "rotation_strategy",
-                "message": "Designing rotation strategy...",
-                "percent": 10,
-            },
+            update_screen_status=True,
         )
+    finally:
+        db.close()
 
-        data_package = _build_full_data_package(db, screen.id)
 
-        # Also include master screen if available
-        master = (
-            db.query(ISTMasterScreen)
-            .filter(ISTMasterScreen.screen_id == screen.id)
-            .first()
-        )
-        master_text = ""
-        if master:
-            master_text = (
-                f"\n\n<master_screen>\n{master.ranked_equities}\n</master_screen>"
-            )
-
-        user_prompt = (
-            f"{data_package}{master_text}\n\n"
-            f"Design a phase-based rotation strategy for this investment screen.\n"
-            f"Include phase allocations, rotation triggers, and risk limits.\n"
-            f"Return JSON matching this schema: "
-            f"{RotationStrategyResult.model_json_schema()}"
-        )
-
-        result = await call_claude(
-            system_prompt=ROTATION_STRATEGY_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=RotationStrategyResult,
-            max_tokens=8192,
-        )
-
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "rotation_strategy",
-                "message": "Storing rotation strategy...",
-                "percent": 80,
-            },
-        )
-
-        # Store rotation strategy (INV-BE-06: Pydantic serialization)
-        rotation = ISTRotationStrategy(
-            screen_id=screen.id,
-            phase_allocations=json.dumps([pa.model_dump() for pa in result.phase_allocations]),
-            rotation_triggers=json.dumps([rt.model_dump() for rt in result.rotation_triggers]),
-            risk_limits=json.dumps([rl.model_dump() for rl in result.risk_limits]),
-        )
-        db.add(rotation)
+async def _run_catalyst_calendar(
+    db: Session,
+    screen: ISTScreen,
+    workflow_run_id: int,
+    *,
+    update_screen_status: bool = False,
+) -> dict | None:
+    """Core catalyst-calendar logic reusable by IST and IST_REFRESH."""
+    if update_screen_status:
+        screen.status = "SYNTHESIZING"
         screen.updated_at = datetime.now(timezone.utc)
         db.commit()
 
-        return {
-            "phaseCount": len(result.phase_allocations),
-            "triggerCount": len(result.rotation_triggers),
-            "riskLimitCount": len(result.risk_limits),
-        }
-    finally:
-        db.close()
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "catalyst_calendar",
+            "message": "Building catalyst calendar...",
+            "percent": 10,
+        },
+    )
+
+    data_package = _build_full_data_package(db, screen.id)
+
+    user_prompt = (
+        f"{data_package}\n\n"
+        f"Generate a dated catalyst timeline for all equity candidates.\n"
+        f"Include catalysts from bottleneck resolution triggers, temporal markers, "
+        f"and candidate catalyst fields.\n"
+        f"Return JSON matching this schema: "
+        f"{CatalystCalendarResult.model_json_schema()}"
+    )
+
+    result = await call_claude(
+        system_prompt=CATALYST_CALENDAR_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_model=CatalystCalendarResult,
+        max_tokens=8192,
+    )
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "catalyst_calendar",
+            "message": "Storing catalyst calendar...",
+            "percent": 80,
+        },
+    )
+
+    next_date = None
+    if result.catalysts:
+        sorted_catalysts = sorted(result.catalysts, key=lambda c: c.date)
+        next_date = sorted_catalysts[0].date
+
+    calendar = ISTCatalystCalendar(
+        screen_id=screen.id,
+        catalysts=json.dumps([cat.model_dump() for cat in result.catalysts]),
+        total_catalysts=len(result.catalysts),
+        next_catalyst_date=next_date,
+    )
+    db.add(calendar)
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "totalCatalysts": len(result.catalysts),
+        "nextCatalystDate": next_date,
+    }
 
 
 @register_step("IST", "catalyst_calendar")
 async def handle_catalyst_calendar(workflow_run_id: int) -> dict | None:
-    """Generate dated catalyst timeline via Claude.
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via Pydantic serialization.
-    """
+    """Generate dated catalyst timeline via Claude."""
     db = SessionLocal()
     try:
         screen = (
@@ -790,81 +865,88 @@ async def handle_catalyst_calendar(workflow_run_id: int) -> dict | None:
             .first()
         )
         if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        await emit_sse_event(
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        return await _run_catalyst_calendar(
+            db,
+            screen,
             workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "catalyst_calendar",
-                "message": "Building catalyst calendar...",
-                "percent": 10,
-            },
+            update_screen_status=True,
         )
+    finally:
+        db.close()
 
-        data_package = _build_full_data_package(db, screen.id)
 
-        user_prompt = (
-            f"{data_package}\n\n"
-            f"Generate a dated catalyst timeline for all equity candidates.\n"
-            f"Include catalysts from bottleneck resolution triggers, temporal markers, "
-            f"and candidate catalyst fields.\n"
-            f"Return JSON matching this schema: "
-            f"{CatalystCalendarResult.model_json_schema()}"
-        )
-
-        result = await call_claude(
-            system_prompt=CATALYST_CALENDAR_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=CatalystCalendarResult,
-            max_tokens=8192,
-        )
-
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "catalyst_calendar",
-                "message": "Storing catalyst calendar...",
-                "percent": 80,
-            },
-        )
-
-        # Determine next catalyst date (earliest date string)
-        next_date = None
-        if result.catalysts:
-            # Sort by date string (approximate but functional for dates/quarters)
-            sorted_catalysts = sorted(result.catalysts, key=lambda c: c.date)
-            next_date = sorted_catalysts[0].date
-
-        # Store catalyst calendar (INV-BE-06: Pydantic serialization)
-        calendar = ISTCatalystCalendar(
-            screen_id=screen.id,
-            catalysts=json.dumps([cat.model_dump() for cat in result.catalysts]),
-            total_catalysts=len(result.catalysts),
-            next_catalyst_date=next_date,
-        )
-        db.add(calendar)
+async def _run_stress_tests(
+    db: Session,
+    screen: ISTScreen,
+    workflow_run_id: int,
+    *,
+    update_screen_status: bool = False,
+) -> dict | None:
+    """Core stress-test logic reusable by IST and IST_REFRESH."""
+    if update_screen_status:
+        screen.status = "SYNTHESIZING"
         screen.updated_at = datetime.now(timezone.utc)
         db.commit()
 
-        return {
-            "totalCatalysts": len(result.catalysts),
-            "nextCatalystDate": next_date,
-        }
-    finally:
-        db.close()
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "stress_tests",
+            "message": "Running stress tests...",
+            "percent": 10,
+        },
+    )
+
+    data_package = _build_full_data_package(db, screen.id)
+
+    user_prompt = (
+        f"{data_package}\n\n"
+        f"Perform comprehensive stress tests on this investment thesis.\n"
+        f"Include framework-level macro scenarios, name-level equity-specific tests, "
+        f"and overall survival scores for each equity.\n"
+        f"Return JSON matching this schema: "
+        f"{StressTestResult.model_json_schema()}"
+    )
+
+    result = await call_claude(
+        system_prompt=STRESS_TEST_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        response_model=StressTestResult,
+        max_tokens=16384,
+    )
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "stress_tests",
+            "message": "Storing stress test results...",
+            "percent": 80,
+        },
+    )
+
+    stress = ISTStressTest(
+        screen_id=screen.id,
+        framework_tests=json.dumps([ft.model_dump() for ft in result.framework_tests]),
+        name_tests=json.dumps([nt.model_dump() for nt in result.name_tests]),
+        survival_scores=json.dumps([ss.model_dump() for ss in result.survival_scores]),
+    )
+    db.add(stress)
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "frameworkTestCount": len(result.framework_tests),
+        "nameTestCount": len(result.name_tests),
+        "survivalScoreCount": len(result.survival_scores),
+    }
 
 
 @register_step("IST", "stress_tests")
 async def handle_stress_tests(workflow_run_id: int) -> dict | None:
-    """Perform framework-level + name-level stress tests via Claude.
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via Pydantic serialization.
-    """
+    """Perform framework-level + name-level stress tests via Claude."""
     db = SessionLocal()
     try:
         screen = (
@@ -873,80 +955,172 @@ async def handle_stress_tests(workflow_run_id: int) -> dict | None:
             .first()
         )
         if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        await emit_sse_event(
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        return await _run_stress_tests(
+            db,
+            screen,
             workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "stress_tests",
-                "message": "Running stress tests...",
-                "percent": 10,
-            },
+            update_screen_status=True,
         )
-
-        data_package = _build_full_data_package(db, screen.id)
-
-        user_prompt = (
-            f"{data_package}\n\n"
-            f"Perform comprehensive stress tests on this investment thesis.\n"
-            f"Include framework-level macro scenarios, name-level equity-specific tests, "
-            f"and overall survival scores for each equity.\n"
-            f"Return JSON matching this schema: "
-            f"{StressTestResult.model_json_schema()}"
-        )
-
-        result = await call_claude(
-            system_prompt=STRESS_TEST_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=StressTestResult,
-            max_tokens=16384,
-        )
-
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "stress_tests",
-                "message": "Storing stress test results...",
-                "percent": 80,
-            },
-        )
-
-        # Store stress test (INV-BE-06: Pydantic serialization)
-        stress = ISTStressTest(
-            screen_id=screen.id,
-            framework_tests=json.dumps([ft.model_dump() for ft in result.framework_tests]),
-            name_tests=json.dumps([nt.model_dump() for nt in result.name_tests]),
-            survival_scores=json.dumps([ss.model_dump() for ss in result.survival_scores]),
-        )
-        db.add(stress)
-        screen.updated_at = datetime.now(timezone.utc)
-        db.commit()
-
-        return {
-            "frameworkTestCount": len(result.framework_tests),
-            "nameTestCount": len(result.name_tests),
-            "survivalScoreCount": len(result.survival_scores),
-        }
     finally:
         db.close()
 
 
+async def _run_report_generation(
+    db: Session,
+    screen: ISTScreen,
+    workflow_run_id: int,
+    *,
+    update_screen_status: bool = False,
+) -> dict | None:
+    """Core report-generation logic reusable by IST and IST_REFRESH."""
+    if update_screen_status:
+        screen.status = "SYNTHESIZING"
+        screen.updated_at = datetime.now(timezone.utc)
+        db.commit()
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "report_generation",
+            "message": "Generating Investment Thesis Report...",
+            "percent": 5,
+        },
+    )
+
+    data_package = _build_full_data_package(db, screen.id)
+    master = (
+        db.query(ISTMasterScreen)
+        .filter(ISTMasterScreen.screen_id == screen.id)
+        .first()
+    )
+    rotation = (
+        db.query(ISTRotationStrategy)
+        .filter(ISTRotationStrategy.screen_id == screen.id)
+        .first()
+    )
+    catalyst = (
+        db.query(ISTCatalystCalendar)
+        .filter(ISTCatalystCalendar.screen_id == screen.id)
+        .first()
+    )
+    stress = (
+        db.query(ISTStressTest)
+        .filter(ISTStressTest.screen_id == screen.id)
+        .first()
+    )
+
+    extra_parts = []
+    if master:
+        extra_parts.append(
+            f"<master_screen>\n{master.ranked_equities}\n</master_screen>"
+        )
+    if rotation:
+        extra_parts.append(
+            f"<rotation_strategy>\n"
+            f"Phase Allocations: {rotation.phase_allocations}\n"
+            f"Rotation Triggers: {rotation.rotation_triggers}\n"
+            f"Risk Limits: {rotation.risk_limits}\n"
+            f"</rotation_strategy>"
+        )
+    if catalyst:
+        extra_parts.append(
+            f"<catalyst_calendar>\n{catalyst.catalysts}\n</catalyst_calendar>"
+        )
+    if stress:
+        extra_parts.append(
+            f"<stress_tests>\n"
+            f"Framework Tests: {stress.framework_tests}\n"
+            f"Name Tests: {stress.name_tests}\n"
+            f"Survival Scores: {stress.survival_scores}\n"
+            f"</stress_tests>"
+        )
+    extra_data = "\n\n".join(extra_parts)
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "report_generation",
+            "message": "Generating Investment Thesis Report via Claude...",
+            "percent": 20,
+        },
+    )
+
+    user_prompt = (
+        f"{data_package}\n\n"
+        f"{extra_data}\n\n"
+        f"Generate the complete Investment Thesis Report in markdown format.\n"
+        f"Follow the report structure specified in the system prompt.\n"
+        f"REMINDER: No new numbers, estimates, or claims. This is synthesis only."
+    )
+
+    report_content = await call_claude_raw(
+        system_prompt=REPORT_GENERATION_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        max_tokens=16384,
+    )
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "report_generation",
+            "message": "Storing Investment Thesis Report...",
+            "percent": 85,
+        },
+    )
+
+    bottleneck_count = (
+        db.query(ISTBottleneck)
+        .filter(ISTBottleneck.screen_id == screen.id)
+        .count()
+    )
+    candidates = (
+        db.query(ISTEquityCandidate)
+        .filter(ISTEquityCandidate.screen_id == screen.id)
+        .all()
+    )
+    tier1_count = sum(1 for c in candidates if c.tier == 1)
+    tier2_count = sum(1 for c in candidates if c.tier == 2)
+    tier3_count = sum(1 for c in candidates if c.tier == 3)
+    word_count = len(report_content.split())
+
+    from app.config import settings
+
+    report_metadata = json.dumps({
+        "pillarCount": bottleneck_count,
+        "equityCount": len(candidates),
+        "tier1Count": tier1_count,
+        "tier2Count": tier2_count,
+        "tier3Count": tier3_count,
+        "wordCount": word_count,
+        "model": settings.claude_model,
+    })
+
+    title = f"Investment Thesis Report: {screen.name}"
+    report = ISTReport(
+        screen_id=screen.id,
+        title=title,
+        content=report_content,
+        report_metadata=report_metadata,
+    )
+    db.add(report)
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "title": title,
+        "wordCount": word_count,
+        "pillarCount": bottleneck_count,
+        "equityCount": len(candidates),
+    }
+
+
 @register_step("IST", "report_generation")
 async def handle_report_generation(workflow_run_id: int) -> dict | None:
-    """Generate the full markdown Investment Thesis Report -- PRIMARY IST deliverable.
-
-    Uses call_claude_raw() for unstructured markdown output.
-
-    INV-AI-04: System prompt includes explicit anti-hallucination instruction:
-    "No new numbers, estimates, or claims. This is synthesis only."
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via Pydantic serialization.
-    """
+    """Generate the full markdown Investment Thesis Report."""
     db = SessionLocal()
     try:
         screen = (
@@ -955,154 +1129,13 @@ async def handle_report_generation(workflow_run_id: int) -> dict | None:
             .first()
         )
         if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        await emit_sse_event(
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        return await _run_report_generation(
+            db,
+            screen,
             workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "report_generation",
-                "message": "Generating Investment Thesis Report...",
-                "percent": 5,
-            },
+            update_screen_status=True,
         )
-
-        # Build full data package
-        data_package = _build_full_data_package(db, screen.id)
-
-        # Load Phase 5 synthesis artifacts for report context
-        master = (
-            db.query(ISTMasterScreen)
-            .filter(ISTMasterScreen.screen_id == screen.id)
-            .first()
-        )
-        rotation = (
-            db.query(ISTRotationStrategy)
-            .filter(ISTRotationStrategy.screen_id == screen.id)
-            .first()
-        )
-        catalyst = (
-            db.query(ISTCatalystCalendar)
-            .filter(ISTCatalystCalendar.screen_id == screen.id)
-            .first()
-        )
-        stress = (
-            db.query(ISTStressTest)
-            .filter(ISTStressTest.screen_id == screen.id)
-            .first()
-        )
-
-        # Build extra data XML from Phase 5 artifacts
-        extra_parts = []
-        if master:
-            extra_parts.append(
-                f"<master_screen>\n{master.ranked_equities}\n</master_screen>"
-            )
-        if rotation:
-            extra_parts.append(
-                f"<rotation_strategy>\n"
-                f"Phase Allocations: {rotation.phase_allocations}\n"
-                f"Rotation Triggers: {rotation.rotation_triggers}\n"
-                f"Risk Limits: {rotation.risk_limits}\n"
-                f"</rotation_strategy>"
-            )
-        if catalyst:
-            extra_parts.append(
-                f"<catalyst_calendar>\n{catalyst.catalysts}\n</catalyst_calendar>"
-            )
-        if stress:
-            extra_parts.append(
-                f"<stress_tests>\n"
-                f"Framework Tests: {stress.framework_tests}\n"
-                f"Name Tests: {stress.name_tests}\n"
-                f"Survival Scores: {stress.survival_scores}\n"
-                f"</stress_tests>"
-            )
-        extra_data = "\n\n".join(extra_parts)
-
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "report_generation",
-                "message": "Generating Investment Thesis Report via Claude...",
-                "percent": 20,
-            },
-        )
-
-        user_prompt = (
-            f"{data_package}\n\n"
-            f"{extra_data}\n\n"
-            f"Generate the complete Investment Thesis Report in markdown format.\n"
-            f"Follow the report structure specified in the system prompt.\n"
-            f"REMINDER: No new numbers, estimates, or claims. This is synthesis only."
-        )
-
-        # Use call_claude_raw for unstructured markdown (not Pydantic-parsed)
-        report_content = await call_claude_raw(
-            system_prompt=REPORT_GENERATION_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            max_tokens=16384,
-        )
-
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "report_generation",
-                "message": "Storing Investment Thesis Report...",
-                "percent": 85,
-            },
-        )
-
-        # Count pillars (bottlenecks) and equities for metadata
-        bottleneck_count = (
-            db.query(ISTBottleneck)
-            .filter(ISTBottleneck.screen_id == screen.id)
-            .count()
-        )
-        candidates = (
-            db.query(ISTEquityCandidate)
-            .filter(ISTEquityCandidate.screen_id == screen.id)
-            .all()
-        )
-        tier1_count = sum(1 for c in candidates if c.tier == 1)
-        tier2_count = sum(1 for c in candidates if c.tier == 2)
-        tier3_count = sum(1 for c in candidates if c.tier == 3)
-        word_count = len(report_content.split())
-
-        from app.config import settings
-        report_metadata = json.dumps({
-            "pillarCount": bottleneck_count,
-            "equityCount": len(candidates),
-            "tier1Count": tier1_count,
-            "tier2Count": tier2_count,
-            "tier3Count": tier3_count,
-            "wordCount": word_count,
-            "model": settings.claude_model,
-        })
-
-        # Generate title from screen name
-        title = f"Investment Thesis Report: {screen.name}"
-
-        report = ISTReport(
-            screen_id=screen.id,
-            title=title,
-            content=report_content,
-            report_metadata=report_metadata,
-        )
-        db.add(report)
-        screen.updated_at = datetime.now(timezone.utc)
-        db.commit()
-
-        return {
-            "title": title,
-            "wordCount": word_count,
-            "pillarCount": bottleneck_count,
-            "equityCount": len(candidates),
-        }
     finally:
         db.close()
 
@@ -1337,16 +1370,94 @@ async def handle_screen_coherence_gate(workflow_run_id: int) -> dict | None:
         db.close()
 
 
+async def _run_screen_certification(
+    db: Session,
+    screen: ISTScreen,
+    workflow_run_id: int,
+    *,
+    update_screen_status: bool = False,
+) -> dict | None:
+    """Core certification logic reusable by IST and IST_REFRESH."""
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "screen_certification",
+            "message": "Certifying screen...",
+            "percent": 20,
+        },
+    )
+
+    now = datetime.now(timezone.utc)
+    report = (
+        db.query(ISTReport)
+        .filter(ISTReport.screen_id == screen.id)
+        .first()
+    )
+    master = (
+        db.query(ISTMasterScreen)
+        .filter(ISTMasterScreen.screen_id == screen.id)
+        .first()
+    )
+    invariant_results = _run_invariant_checks(db, screen.id)
+    invariants_passed = sum(1 for inv in invariant_results if inv["status"] == "PASS")
+    invariants_failed = sum(1 for inv in invariant_results if inv["status"] == "FAIL")
+
+    report_meta = {}
+    if report and report.report_metadata:
+        try:
+            report_meta = json.loads(report.report_metadata)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    certification_data = {
+        "certifiedAt": now.isoformat(),
+        "gate3Passed": True,
+        "invariantsPassed": invariants_passed,
+        "invariantsFailed": invariants_failed,
+        "invariantResults": invariant_results,
+        "reportWordCount": report_meta.get("wordCount", 0),
+        "pillarCount": report_meta.get("pillarCount", 0),
+        "equityCount": report_meta.get("equityCount", 0),
+        "tierBreakdown": {
+            "tier1": report_meta.get("tier1Count", 0),
+            "tier2": report_meta.get("tier2Count", 0),
+            "tier3": report_meta.get("tier3Count", 0),
+        },
+        "totalRankedEquities": master.total_equities if master else 0,
+        "model": report_meta.get("model", "unknown"),
+    }
+
+    screen.is_certified = 1
+    screen.certified_at = now
+    if update_screen_status:
+        screen.status = "COMPLETED"
+    screen.updated_at = now
+    screen.certification = json.dumps(certification_data)
+    db.commit()
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "screen_certification",
+            "message": "Screen certified successfully.",
+            "percent": 100,
+        },
+    )
+
+    return {
+        "certified": True,
+        "certifiedAt": now.isoformat(),
+        "status": "COMPLETED" if update_screen_status else screen.status,
+        "invariantsPassed": invariants_passed,
+        "invariantsFailed": invariants_failed,
+    }
+
+
 @register_step("IST", "screen_certification")
 async def handle_screen_certification(workflow_run_id: int) -> dict | None:
-    """Certify the screen and record certification metadata -- no Claude call.
-
-    Updates ISTScreen: is_certified = 1, certified_at = now, status = COMPLETED.
-    Writes Gate 3 certification results to `ISTScreen.certification` JSON column.
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via json.dumps.
-    """
+    """Certify the screen and record certification metadata."""
     db = SessionLocal()
     try:
         screen = (
@@ -1355,102 +1466,114 @@ async def handle_screen_certification(workflow_run_id: int) -> dict | None:
             .first()
         )
         if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        await emit_sse_event(
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        return await _run_screen_certification(
+            db,
+            screen,
             workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "screen_certification",
-                "message": "Certifying screen...",
-                "percent": 20,
-            },
+            update_screen_status=True,
         )
-
-        now = datetime.now(timezone.utc)
-
-        # Gather certification metadata from completed artifacts
-        report = (
-            db.query(ISTReport)
-            .filter(ISTReport.screen_id == screen.id)
-            .first()
-        )
-        master = (
-            db.query(ISTMasterScreen)
-            .filter(ISTMasterScreen.screen_id == screen.id)
-            .first()
-        )
-        invariant_results = _run_invariant_checks(db, screen.id)
-        invariants_passed = sum(1 for inv in invariant_results if inv["status"] == "PASS")
-        invariants_failed = sum(1 for inv in invariant_results if inv["status"] == "FAIL")
-
-        report_meta = {}
-        if report and report.report_metadata:
-            try:
-                report_meta = json.loads(report.report_metadata)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        certification_data = {
-            "certifiedAt": now.isoformat(),
-            "gate3Passed": True,
-            "invariantsPassed": invariants_passed,
-            "invariantsFailed": invariants_failed,
-            "invariantResults": invariant_results,
-            "reportWordCount": report_meta.get("wordCount", 0),
-            "pillarCount": report_meta.get("pillarCount", 0),
-            "equityCount": report_meta.get("equityCount", 0),
-            "tierBreakdown": {
-                "tier1": report_meta.get("tier1Count", 0),
-                "tier2": report_meta.get("tier2Count", 0),
-                "tier3": report_meta.get("tier3Count", 0),
-            },
-            "totalRankedEquities": master.total_equities if master else 0,
-            "model": report_meta.get("model", "unknown"),
-        }
-
-        # Update screen certification fields
-        screen.is_certified = 1
-        screen.certified_at = now
-        screen.status = "COMPLETED"
-        screen.updated_at = now
-        screen.certification = json.dumps(certification_data)
-
-        db.commit()
-
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "screen_certification",
-                "message": "Screen certified successfully.",
-                "percent": 100,
-            },
-        )
-
-        return {
-            "certified": True,
-            "certifiedAt": now.isoformat(),
-            "status": "COMPLETED",
-            "invariantsPassed": invariants_passed,
-            "invariantsFailed": invariants_failed,
-        }
     finally:
         db.close()
 
 
+async def _run_hfrt_handoff_generation(
+    db: Session,
+    screen: ISTScreen,
+    workflow_run_id: int,
+    *,
+    update_screen_status: bool = False,
+) -> dict | None:
+    """Core HFRT-handoff logic reusable by IST and IST_REFRESH."""
+    if not screen.is_certified:
+        raise ValueError(
+            f"Screen {screen.id} is not certified. "
+            "Certification must pass before generating HFRT handoff."
+        )
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "hfrt_handoff_generation",
+            "message": "Building HFRT handoff from Tier 1 candidates...",
+            "percent": 20,
+        },
+    )
+
+    tier1_candidates = (
+        db.query(ISTEquityCandidate)
+        .filter(
+            ISTEquityCandidate.screen_id == screen.id,
+            ISTEquityCandidate.tier == 1,
+        )
+        .order_by(ISTEquityCandidate.id)
+        .all()
+    )
+
+    bn_ids = {c.bottleneck_id for c in tier1_candidates if c.bottleneck_id}
+    bn_map = {}
+    if bn_ids:
+        bns = (
+            db.query(ISTBottleneck)
+            .filter(ISTBottleneck.id.in_(bn_ids))
+            .all()
+        )
+        bn_map = {bn.id: bn.name for bn in bns}
+
+    handoff_candidates = []
+    for cand in tier1_candidates:
+        scarcity_val = None
+        if cand.scarcity_score:
+            try:
+                parsed = json.loads(cand.scarcity_score)
+                scarcity_val = parsed.get("overall") if isinstance(parsed, dict) else parsed
+            except (json.JSONDecodeError, TypeError):
+                scarcity_val = None
+        handoff_candidates.append({
+            "ticker": cand.ticker,
+            "companyName": cand.company_name,
+            "tier": cand.tier,
+            "conviction": cand.conviction,
+            "pillar": bn_map.get(cand.bottleneck_id, "Unknown"),
+            "catalyst": cand.catalyst,
+            "scarcityScore": scarcity_val,
+        })
+
+    handoff_data = {
+        "screenName": screen.name,
+        "screenId": screen.id,
+        "certifiedAt": screen.certified_at.isoformat() if screen.certified_at else None,
+        "tier1Count": len(handoff_candidates),
+        "candidates": handoff_candidates,
+    }
+
+    screen.hfrt_handoff = json.dumps(handoff_data)
+    if update_screen_status:
+        screen.status = "COMPLETED"
+    screen.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    await emit_sse_event(
+        workflow_run_id,
+        "step_progress",
+        {
+            "stepName": "hfrt_handoff_generation",
+            "message": f"HFRT handoff ready: {len(handoff_candidates)} Tier 1 candidate(s).",
+            "percent": 100,
+        },
+    )
+
+    return {
+        "screenName": screen.name,
+        "tier1Count": len(handoff_candidates),
+        "candidates": [c["ticker"] for c in handoff_candidates],
+    }
+
+
 @register_step("IST", "hfrt_handoff_generation")
 async def handle_hfrt_handoff_generation(workflow_run_id: int) -> dict | None:
-    """Generate HFRT handoff data from certified screen -- no Claude call.
-
-    Extracts Tier 1 candidates and writes structured handoff data to
-    `ISTScreen.hfrt_handoff` JSON column for the IST->HFRT bridge.
-
-    INV-BE-05: Creates its own SessionLocal, closed in finally block.
-    INV-BE-06: JSON columns written via json.dumps.
-    """
+    """Generate HFRT handoff data from certified screen."""
     db = SessionLocal()
     try:
         screen = (
@@ -1459,96 +1582,12 @@ async def handle_hfrt_handoff_generation(workflow_run_id: int) -> dict | None:
             .first()
         )
         if not screen:
-            raise ValueError(
-                f"No IST screen found for workflow {workflow_run_id}"
-            )
-
-        if not screen.is_certified:
-            raise ValueError(
-                f"Screen {screen.id} is not certified. "
-                "Certification must pass before generating HFRT handoff."
-            )
-
-        await emit_sse_event(
+            raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        return await _run_hfrt_handoff_generation(
+            db,
+            screen,
             workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "hfrt_handoff_generation",
-                "message": "Building HFRT handoff from Tier 1 candidates...",
-                "percent": 20,
-            },
+            update_screen_status=False,
         )
-
-        # Build HFRT handoff data from Tier 1 candidates
-        tier1_candidates = (
-            db.query(ISTEquityCandidate)
-            .filter(
-                ISTEquityCandidate.screen_id == screen.id,
-                ISTEquityCandidate.tier == 1,
-            )
-            .order_by(ISTEquityCandidate.id)
-            .all()
-        )
-
-        # Load bottleneck names for the handoff (INV-PE-01: batch)
-        bn_ids = {c.bottleneck_id for c in tier1_candidates if c.bottleneck_id}
-        bn_map = {}
-        if bn_ids:
-            bns = (
-                db.query(ISTBottleneck)
-                .filter(ISTBottleneck.id.in_(bn_ids))
-                .all()
-            )
-            bn_map = {bn.id: bn.name for bn in bns}
-
-        handoff_candidates = []
-        for cand in tier1_candidates:
-            # scarcity_score is stored as JSON text: {"overall": 4.6, "dimensions": {...}}
-            # Extract the numeric overall score for the handoff.
-            scarcity_val = None
-            if cand.scarcity_score:
-                try:
-                    parsed = json.loads(cand.scarcity_score)
-                    scarcity_val = parsed.get("overall") if isinstance(parsed, dict) else parsed
-                except (json.JSONDecodeError, TypeError):
-                    scarcity_val = None
-            handoff_candidates.append({
-                "ticker": cand.ticker,
-                "companyName": cand.company_name,
-                "tier": cand.tier,
-                "conviction": cand.conviction,
-                "pillar": bn_map.get(cand.bottleneck_id, "Unknown"),
-                "catalyst": cand.catalyst,
-                "scarcityScore": scarcity_val,
-            })
-
-        handoff_data = {
-            "screenName": screen.name,
-            "screenId": screen.id,
-            "certifiedAt": screen.certified_at.isoformat() if screen.certified_at else None,
-            "tier1Count": len(handoff_candidates),
-            "candidates": handoff_candidates,
-        }
-
-        # Write to hfrt_handoff column (INV-BE-06)
-        screen.hfrt_handoff = json.dumps(handoff_data)
-        screen.updated_at = datetime.now(timezone.utc)
-        db.commit()
-
-        await emit_sse_event(
-            workflow_run_id,
-            "step_progress",
-            {
-                "stepName": "hfrt_handoff_generation",
-                "message": f"HFRT handoff ready: {len(handoff_candidates)} Tier 1 candidate(s).",
-                "percent": 100,
-            },
-        )
-
-        return {
-            "screenName": screen.name,
-            "tier1Count": len(handoff_candidates),
-            "candidates": [c["ticker"] for c in handoff_candidates],
-        }
     finally:
         db.close()

@@ -263,6 +263,14 @@ class ISTClaimResponse(BaseModel):
     validation_source: Optional[str] = Field(
         default=None, alias="validationSource"
     )
+    source_refresh_id: Optional[int] = Field(
+        default=None,
+        alias="sourceRefreshId",
+    )
+    source_refresh_number: Optional[int] = Field(
+        default=None,
+        alias="sourceRefreshNumber",
+    )
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -274,5 +282,55 @@ class ISTClaimsListResponse(BaseModel):
     claims: list[ISTClaimResponse]
     total_count: int = Field(alias="totalCount")
     validated_count: int = Field(alias="validatedCount")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ScreenRefreshListItem(BaseModel):
+    """Response schema for refresh list rows."""
+
+    id: int
+    workflow_run_id: int = Field(alias="workflowRunId")
+    refresh_number: int = Field(alias="refreshNumber")
+    status: str
+    content_type: str = Field(alias="contentType")
+    delta_claim_count: int = Field(alias="deltaClaimCount")
+    new_claims_count: int = Field(default=0, alias="newClaimsCount")
+    tier_change_count: int = Field(default=0, alias="tierChangeCount")
+    steps_reexecuted: Optional[list[str]] = Field(default=None, alias="stepsReexecuted")
+    impact_assessment: Optional[dict[str, Any]] = Field(default=None, alias="impactAssessment")
+    error_message: Optional[str] = Field(default=None, alias="errorMessage")
+    is_active: bool = Field(alias="isActive")
+    started_at: Optional[str] = Field(default=None, alias="startedAt")
+    completed_at: Optional[str] = Field(default=None, alias="completedAt")
+    created_at: Optional[str] = Field(default=None, alias="createdAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ScreenRefreshDetail(BaseModel):
+    """Response schema for refresh detail."""
+
+    id: int
+    screen_id: int = Field(alias="screenId")
+    workflow_run_id: int = Field(alias="workflowRunId")
+    refresh_number: int = Field(alias="refreshNumber")
+    status: str
+    content_type: str = Field(alias="contentType")
+    delta_content: str = Field(alias="deltaContent")
+    delta_claim_count: int = Field(alias="deltaClaimCount")
+    new_claims_count: int = Field(default=0, alias="newClaimsCount")
+    new_claims: list[dict[str, Any]] = Field(default_factory=list, alias="newClaims")
+    new_source_bias: Optional[dict[str, Any]] = Field(default=None, alias="newSourceBias")
+    tier_changes: list[dict[str, Any]] = Field(default_factory=list, alias="tierChanges")
+    tier_change_count: int = Field(default=0, alias="tierChangeCount")
+    steps_reexecuted: Optional[list[str]] = Field(default=None, alias="stepsReexecuted")
+    impact_assessment: Optional[dict[str, Any]] = Field(default=None, alias="impactAssessment")
+    refresh_notes: Optional[dict[str, Any]] = Field(default=None, alias="refreshNotes")
+    error_message: Optional[str] = Field(default=None, alias="errorMessage")
+    is_active: bool = Field(alias="isActive")
+    started_at: Optional[str] = Field(default=None, alias="startedAt")
+    completed_at: Optional[str] = Field(default=None, alias="completedAt")
+    created_at: Optional[str] = Field(default=None, alias="createdAt")
 
     model_config = ConfigDict(populate_by_name=True)
