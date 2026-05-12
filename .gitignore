@@ -43,3 +43,11 @@ out/
 # Cache
 .cache/
 .litellm/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Local Claude Code settings
+.claude/settings.local.json
