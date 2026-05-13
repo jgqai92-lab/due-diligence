@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo, Fragment } from "react";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
 import {
@@ -21,7 +21,13 @@ import {
   Send,
 } from "lucide-react";
 
-// ─── Conviction Badge Config ──────────────────────────────────────────
+// ─── Badge Config ────────────────────────────────────────────────────
+
+const TIER_CONFIG: Record<number, { bg: string; text: string; label: string }> = {
+  1: { bg: "bg-emerald-500/10", text: "text-emerald-400", label: "Tier 1" },
+  2: { bg: "bg-amber-500/10", text: "text-amber-400", label: "Tier 2" },
+  3: { bg: "bg-white/10", text: "text-text-secondary", label: "Tier 3" },
+};
 
 const CONVICTION_CONFIG: Record<string, { bg: string; text: string }> = {
   HIGH:   { bg: "bg-emerald-500/10", text: "text-emerald-400" },
@@ -115,6 +121,12 @@ export default function HandoffPanel({ screenId, isCertified }: HandoffPanelProp
     }
   }, [screenId, selected, data]);
 
+  // Sort candidates by tier (ascending), preserving original order within each tier
+  const sortedCandidates = useMemo(() => {
+    if (!data) return [];
+    return [...data.candidates].sort((a, b) => a.tier - b.tier);
+  }, [data]);
+
   // ─── Guard: Not Certified ──────────────────────────────────────
 
   if (!isCertified) return null;
@@ -165,7 +177,7 @@ export default function HandoffPanel({ screenId, isCertified }: HandoffPanelProp
         </div>
         <p className="text-sm font-medium text-text-primary">No handoff candidates available</p>
         <p className="text-xs text-text-secondary mt-1">
-          Tier 1 candidates will appear here once the screen is fully certified.
+          Candidates will appear here once the screen is fully certified.
         </p>
       </div>
     );
@@ -262,13 +274,37 @@ export default function HandoffPanel({ screenId, isCertified }: HandoffPanelProp
               HFRT Deep Research Handoff
             </h3>
             <p className="text-xs text-text-secondary mt-0.5">
-              Select Tier 1 candidates to send to deep equity research
+              Select candidates to send to deep equity research
             </p>
           </div>
         </div>
-        <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400">
-          {data.tier1Count} Tier 1 candidate{data.tier1Count !== 1 ? "s" : ""}
-        </span>
+        <div className="flex items-center gap-2 flex-wrap">
+          {data.tierBreakdown ? (
+            <>
+              {([1, 2, 3] as const).map((tier) => {
+                const cfg = TIER_CONFIG[tier];
+                const count = data.tierBreakdown![`tier${tier}` as keyof typeof data.tierBreakdown];
+                if (!count) return null;
+                return (
+                  <span
+                    key={tier}
+                    className={cn(
+                      "inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium",
+                      cfg.bg,
+                      cfg.text
+                    )}
+                  >
+                    {cfg.label}: {count}
+                  </span>
+                );
+              })}
+            </>
+          ) : (
+            <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400">
+              {data.tier1Count} Tier 1 candidate{data.tier1Count !== 1 ? "s" : ""}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Select all / Deselect all controls */}
@@ -322,6 +358,9 @@ export default function HandoffPanel({ screenId, isCertified }: HandoffPanelProp
                 Company
               </th>
               <th className="px-3 py-2.5 text-[11px] font-medium text-text-secondary" scope="col">
+                Tier
+              </th>
+              <th className="px-3 py-2.5 text-[11px] font-medium text-text-secondary" scope="col">
                 Conviction
               </th>
               <th className="px-3 py-2.5 text-[11px] font-medium text-text-secondary" scope="col">
@@ -336,14 +375,35 @@ export default function HandoffPanel({ screenId, isCertified }: HandoffPanelProp
             </tr>
           </thead>
           <tbody>
-            {data.candidates.map((candidate) => (
-              <CandidateRow
-                key={candidate.ticker}
-                candidate={candidate}
-                isSelected={selected.has(candidate.ticker)}
-                onToggle={() => toggleCandidate(candidate.ticker)}
-              />
-            ))}
+            {sortedCandidates.map((candidate, idx) => {
+              const prevTier = idx > 0 ? sortedCandidates[idx - 1].tier : null;
+              const showGroupHeader = candidate.tier !== prevTier;
+              const tierCfg = TIER_CONFIG[candidate.tier] ?? TIER_CONFIG[3];
+              return (
+                <Fragment key={candidate.ticker}>
+                  {showGroupHeader && (
+                    <tr className="bg-white/3">
+                      <td colSpan={8} className="px-3 py-2">
+                        <span
+                          className={cn(
+                            "inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold",
+                            tierCfg.bg,
+                            tierCfg.text
+                          )}
+                        >
+                          {tierCfg.label}
+                        </span>
+                      </td>
+                    </tr>
+                  )}
+                  <CandidateRow
+                    candidate={candidate}
+                    isSelected={selected.has(candidate.ticker)}
+                    onToggle={() => toggleCandidate(candidate.ticker)}
+                  />
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -405,6 +465,7 @@ function CandidateRow({
   onToggle: () => void;
 }) {
   const convCfg = CONVICTION_CONFIG[candidate.conviction] ?? CONVICTION_CONFIG.LOW;
+  const tierCfg = TIER_CONFIG[candidate.tier] ?? TIER_CONFIG[3];
 
   // Scarcity score color
   const scarcityColor =
@@ -440,6 +501,17 @@ function CandidateRow({
       </td>
       <td className="px-3 py-3 text-xs text-text-primary">
         {candidate.companyName}
+      </td>
+      <td className="px-3 py-3">
+        <span
+          className={cn(
+            "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium",
+            tierCfg.bg,
+            tierCfg.text
+          )}
+        >
+          {tierCfg.label}
+        </span>
       </td>
       <td className="px-3 py-3">
         <span

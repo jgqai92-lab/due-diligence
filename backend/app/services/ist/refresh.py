@@ -42,13 +42,14 @@ from app.services.ist.thematic_analysis import (
     _run_demand_modeling,
     _run_external_validation,
 )
+from app.services.ist.claude_client import get_step_model_tier
 from app.services.workflow_engine import register_step
 
 logger = logging.getLogger(__name__)
 
 
 IST_REFRESH_WORKFLOW_STEPS = [
-    {"step_name": "delta_extraction", "phase": 1, "phase_name": "Delta Extraction", "step_order": 1, "depends_on": [], "model": "opus"},
+    {"step_name": "delta_extraction", "phase": 1, "phase_name": "Delta Extraction", "step_order": 1, "depends_on": [], "model": "sonnet"},
     {"step_name": "delta_bias_assessment", "phase": 1, "phase_name": "Delta Extraction", "step_order": 2, "depends_on": ["delta_extraction"], "model": "sonnet"},
     {"step_name": "delta_sufficiency_gate", "phase": 1, "phase_name": "Delta Extraction", "step_order": 3, "depends_on": ["delta_bias_assessment"], "model": "none"},
     {"step_name": "impact_assessment", "phase": 2, "phase_name": "Re-Analysis", "step_order": 4, "depends_on": ["delta_sufficiency_gate"], "model": "opus"},
@@ -134,6 +135,7 @@ async def handle_delta_extraction(workflow_run_id: int) -> dict | None:
         refresh.started_at = refresh.started_at or datetime.now(timezone.utc)
         db.commit()
 
+        model = await get_step_model_tier(workflow_run_id, "delta_extraction")
         result = await _run_content_extraction(
             screen,
             db,
@@ -142,6 +144,7 @@ async def handle_delta_extraction(workflow_run_id: int) -> dict | None:
             claim_source_refresh_id=refresh.id,
             update_screen_status=False,
             replace_claims=False,
+            model=model,
         )
 
         _merge_refresh_notes(
@@ -197,12 +200,14 @@ async def handle_delta_bias_assessment(workflow_run_id: int) -> dict | None:
         refresh.status = "EXTRACTING"
         db.commit()
 
+        model = await get_step_model_tier(workflow_run_id, "delta_bias_assessment")
         result = await _run_source_bias(
             screen,
             db,
             workflow_run_id,
             raw_content=refresh.delta_content,
             target_refresh=refresh,
+            model=model,
         )
         _merge_refresh_notes(refresh, {"deltaBiasAssessment": result or {}})
         db.commit()
@@ -342,6 +347,7 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
         )
 
         if _needed("bottleneck_mapping"):
+            model = await get_step_model_tier(workflow_run_id, "selective_reanalysis")
             await _run_bottleneck_mapping(
                 screen,
                 claims,
@@ -349,6 +355,7 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
                 workflow_run_id,
                 update_screen_status=False,
                 replace_artifact=True,
+                model=model,
             )
             steps_reexecuted.append("bottleneck_mapping")
 
@@ -366,6 +373,7 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
                 db,
                 workflow_run_id,
                 replace_artifact=True,
+                model=model,
             )
             steps_reexecuted.append("demand_modeling")
 
@@ -376,6 +384,7 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
                 db,
                 workflow_run_id,
                 replace_artifact=True,
+                model=model,
             )
             steps_reexecuted.append("external_validation")
 
@@ -401,6 +410,7 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
                 workflow_run_id,
                 update_screen_status=False,
                 replace_artifact=True,
+                model=model,
             )
             steps_reexecuted.append("equity_scanning")
 
@@ -428,6 +438,7 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
                 db,
                 workflow_run_id,
                 replace_artifact=True,
+                model=model,
             )
             steps_reexecuted.append("effects_analysis")
 
@@ -438,18 +449,21 @@ async def handle_selective_reanalysis(workflow_run_id: int) -> dict | None:
                 workflow_run_id,
                 update_screen_status=False,
                 replace_artifact=True,
+                model=model,
             )
             await _run_dialectic_pessimist(
                 screen,
                 db,
                 workflow_run_id,
                 replace_artifact=True,
+                model=model,
             )
             await _run_dialectic_synthesis(
                 screen,
                 db,
                 workflow_run_id,
                 replace_artifact=True,
+                model=model,
             )
             steps_reexecuted.extend(
                 [
@@ -575,35 +589,41 @@ async def handle_conditional_resynthesis(workflow_run_id: int) -> dict | None:
             db.query(ISTMasterScreen).filter(ISTMasterScreen.screen_id == screen.id).delete()
             db.commit()
 
+            model = await get_step_model_tier(workflow_run_id, "conditional_resynthesis")
             await _run_master_screen(
                 db,
                 screen,
                 workflow_run_id,
                 update_screen_status=False,
+                model=model,
             )
             await _run_rotation_strategy(
                 db,
                 screen,
                 workflow_run_id,
                 update_screen_status=False,
+                model=model,
             )
             await _run_catalyst_calendar(
                 db,
                 screen,
                 workflow_run_id,
                 update_screen_status=False,
+                model=model,
             )
             await _run_stress_tests(
                 db,
                 screen,
                 workflow_run_id,
                 update_screen_status=False,
+                model=model,
             )
             await _run_report_generation(
                 db,
                 screen,
                 workflow_run_id,
                 update_screen_status=False,
+                model=model,
             )
 
             screen.updated_at = datetime.now(timezone.utc)

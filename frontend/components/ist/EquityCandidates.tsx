@@ -212,7 +212,7 @@ function CandidateRow({ candidate }: { candidate: EquityCandidate }) {
                 {candidate.moatType && (
                   <div>
                     <p className="text-[11px] font-medium text-text-secondary mb-1">Moat</p>
-                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-violet-500/10 text-violet-400 mb-1">
+                    <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium bg-violet-500/10 text-violet-400 mb-1">
                       {candidate.moatType}
                     </span>
                     {candidate.moatEvidence && (

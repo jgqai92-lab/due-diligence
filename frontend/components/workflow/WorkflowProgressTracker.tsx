@@ -266,14 +266,14 @@ export default function WorkflowProgressTracker({
               Cancel
             </button>
           )}
-          {status === "FAILED" && onRetry && (
+          {(status === "FAILED" || status === "RUNNING") && onRetry && (
             <button
               onClick={onRetry}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2"
-              aria-label="Retry workflow from failed step"
+              aria-label={status === "RUNNING" ? "Recover orphaned workflow" : "Retry workflow from failed step"}
             >
               <RotateCcw size={14} />
-              Retry
+              {status === "RUNNING" ? "Recover" : "Retry"}
             </button>
           )}
         </div>

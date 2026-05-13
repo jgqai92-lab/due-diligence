@@ -51,6 +51,8 @@ class HFRTProject(Base):
     # Bridge source tracking
     source = Column(Text, nullable=True)  # "IST_HANDOFF" or null for manual
     ist_screen_id = Column(Integer, nullable=True)  # Source IST screen ID (soft FK)
+    # External validation results (Gap 1: Perplexity-grounded claim validation)
+    external_validation_results = Column(Text, nullable=True)  # JSON: HFRTValidationResult
     # Certification & invariants
     is_certified = Column(Integer, nullable=False, default=0)
     certified_at = Column(DateTime, nullable=True)

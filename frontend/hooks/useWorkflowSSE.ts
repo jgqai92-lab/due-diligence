@@ -23,6 +23,7 @@ interface UseWorkflowSSEReturn {
   workflowStatus: WorkflowStatus | null;
   lastEvent: SSEEvent | null;
   error: string | null;
+  reconnect: () => void;
 }
 
 /**
@@ -108,9 +109,7 @@ export function useWorkflowSSE(options: UseWorkflowSSEOptions): UseWorkflowSSERe
             next.set(data.stepName!, { status: 'COMPLETED', durationMs: duration });
             return next;
           });
-          if (currentStep === data.stepName) {
-            setCurrentStep(null);
-          }
+          setCurrentStep(prev => prev === data.stepName ? null : prev);
           if (callbacksRef.current.onStepComplete && duration != null) {
             callbacksRef.current.onStepComplete(data.stepName, duration);
           }
@@ -125,9 +124,7 @@ export function useWorkflowSSE(options: UseWorkflowSSEOptions): UseWorkflowSSERe
             next.set(data.stepName!, { status: 'FAILED', durationMs: null });
             return next;
           });
-          if (currentStep === data.stepName) {
-            setCurrentStep(null);
-          }
+          setCurrentStep(prev => prev === data.stepName ? null : prev);
         }
         break;
       }
@@ -220,7 +217,8 @@ export function useWorkflowSSE(options: UseWorkflowSSEOptions): UseWorkflowSSERe
         break;
       }
     }
-  }, [currentStep]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- all state uses functional updates; callbacks via ref
+  }, []);
 
   const connect = useCallback(() => {
     if (workflowId == null) return;
@@ -286,6 +284,13 @@ export function useWorkflowSSE(options: UseWorkflowSSEOptions): UseWorkflowSSERe
     };
   }, [workflowId, connect, cleanup]);
 
+  // Force-reconnect: reset retry counter, close existing connection, reconnect.
+  // Useful after retry/recover when the workflow restarts but workflowId stays the same.
+  const reconnect = useCallback(() => {
+    retriesRef.current = 0;
+    connect();
+  }, [connect]);
+
   return {
     connected,
     steps,
@@ -293,5 +298,6 @@ export function useWorkflowSSE(options: UseWorkflowSSEOptions): UseWorkflowSSERe
     workflowStatus,
     lastEvent,
     error,
+    reconnect,
   };
 }

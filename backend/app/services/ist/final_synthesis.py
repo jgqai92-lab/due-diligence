@@ -46,10 +46,40 @@ from app.models.ist import (
     ISTStressTest,
     ISTValidation,
 )
-from app.services.ist.claude_client import call_claude, call_claude_raw
+from app.services.ist.claude_client import call_claude, call_claude_raw, get_step_model_tier
+from app.services.perplexity_client import is_available as perplexity_available, search_and_analyze
 from app.services.workflow_engine import register_step, emit_sse_event
 
 logger = logging.getLogger(__name__)
+
+
+# -- Content-type-aware quality thresholds ------------------------------------
+#
+# Different content types have inherently different information densities.
+# Earnings calls and research notes are data-dense (numbers, guidance, targets).
+# Podcasts and freeform text are conversational/qualitative.  These thresholds
+# calibrate the quality gates to each content type's natural characteristics.
+#
+# inv2_quant_pct  -- minimum % of claims that must have quantitative anchors
+# bottleneck_kw   -- minimum fraction of bottleneck-name keywords found in report
+
+CONTENT_TYPE_THRESHOLDS: dict[str, dict[str, float]] = {
+    "earnings_call":      {"inv2_quant_pct": 50, "bottleneck_kw": 0.60},
+    "research_note":      {"inv2_quant_pct": 45, "bottleneck_kw": 0.60},
+    "article":            {"inv2_quant_pct": 35, "bottleneck_kw": 0.50},
+    "podcast_transcript": {"inv2_quant_pct": 25, "bottleneck_kw": 0.45},
+    "text":               {"inv2_quant_pct": 20, "bottleneck_kw": 0.40},
+}
+
+# Fallback when content_type is unknown or None
+_DEFAULT_THRESHOLDS = {"inv2_quant_pct": 40, "bottleneck_kw": 0.60}
+
+
+def get_thresholds(content_type: str | None) -> dict[str, float]:
+    """Return the quality-gate thresholds for a given content type."""
+    if content_type and content_type in CONTENT_TYPE_THRESHOLDS:
+        return CONTENT_TYPE_THRESHOLDS[content_type]
+    return _DEFAULT_THRESHOLDS
 
 
 # -- Pydantic models for Claude structured output (INV-AI-03) -----------------
@@ -463,11 +493,17 @@ def _build_full_data_package(db, screen_id: int) -> str:
     return data_package
 
 
-def _run_invariant_checks(db, screen_id: int) -> list[dict]:
+def _run_invariant_checks(
+    db, screen_id: int, *, content_type: str | None = None
+) -> list[dict]:
     """Run invariant checks 1-5 and return the results list.
 
     Reuses the same invariant logic from equity_identification.py and the router.
+    When *content_type* is provided, INV-2 uses content-type-aware thresholds
+    (see CONTENT_TYPE_THRESHOLDS).  Falls back to the default 40% when None.
     """
+    thresholds = get_thresholds(content_type)
+    inv2_threshold = thresholds["inv2_quant_pct"]
     invariants = []
 
     # Load data
@@ -497,20 +533,21 @@ def _run_invariant_checks(db, screen_id: int) -> list[dict]:
         ),
     })
 
-    # INV-2: Quantitative Anchor Required (>= 50%)
+    # INV-2: Quantitative Anchor Required (content-type-aware threshold)
     claims_with_quant = sum(
         1 for c in claims
         if c.quantitative_anchor is not None and c.quantitative_anchor.strip() != ""
     )
     quant_pct = (claims_with_quant / total_claims * 100) if total_claims > 0 else 0
-    inv2_pass = total_claims > 0 and quant_pct >= 50
+    inv2_pass = total_claims > 0 and quant_pct >= inv2_threshold
+    ct_label = f" [{content_type}]" if content_type else ""
     invariants.append({
         "id": "INV-2",
         "name": "Quantitative Anchor Required",
         "status": "PASS" if inv2_pass else "FAIL",
         "details": (
             f"{claims_with_quant}/{total_claims} claims ({quant_pct:.0f}%) have "
-            f"quantitative anchors (>= 50% required)."
+            f"quantitative anchors (>= {inv2_threshold:.0f}% required{ct_label})."
         ),
     })
 
@@ -570,6 +607,7 @@ async def _run_master_screen(
     workflow_run_id: int,
     *,
     update_screen_status: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core master-screen logic reusable by IST and IST_REFRESH."""
     if update_screen_status:
@@ -612,6 +650,7 @@ async def _run_master_screen(
         system_prompt=MASTER_SCREEN_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=MasterScreenResult,
+        model=model,
         max_tokens=8192,
     )
 
@@ -625,20 +664,31 @@ async def _run_master_screen(
         },
     )
 
-    invariants = _run_invariant_checks(db, screen.id)
+    invariants = _run_invariant_checks(db, screen.id, content_type=screen.content_type)
     tier1_count = sum(1 for eq in result.ranked_equities if eq.tier == 1)
 
     ranked_json = json.dumps([eq.model_dump() for eq in result.ranked_equities])
     invariant_json = json.dumps(invariants)
 
-    master = ISTMasterScreen(
-        screen_id=screen.id,
-        ranked_equities=ranked_json,
-        invariant_compliance=invariant_json,
-        total_equities=len(result.ranked_equities),
-        tier1_count=tier1_count,
+    existing_master = (
+        db.query(ISTMasterScreen)
+        .filter(ISTMasterScreen.screen_id == screen.id)
+        .first()
     )
-    db.add(master)
+    if existing_master:
+        existing_master.ranked_equities = ranked_json
+        existing_master.invariant_compliance = invariant_json
+        existing_master.total_equities = len(result.ranked_equities)
+        existing_master.tier1_count = tier1_count
+    else:
+        master = ISTMasterScreen(
+            screen_id=screen.id,
+            ranked_equities=ranked_json,
+            invariant_compliance=invariant_json,
+            total_equities=len(result.ranked_equities),
+            tier1_count=tier1_count,
+        )
+        db.add(master)
 
     for eq_result in result.ranked_equities:
         cand = (
@@ -675,11 +725,13 @@ async def handle_master_screen(workflow_run_id: int) -> dict | None:
         )
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        model = await get_step_model_tier(workflow_run_id, "master_screen")
         return await _run_master_screen(
             db,
             screen,
             workflow_run_id,
             update_screen_status=True,
+            model=model,
         )
     finally:
         db.close()
@@ -691,6 +743,7 @@ async def _run_rotation_strategy(
     workflow_run_id: int,
     *,
     update_screen_status: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core rotation-strategy logic reusable by IST and IST_REFRESH."""
     if update_screen_status:
@@ -730,6 +783,7 @@ async def _run_rotation_strategy(
         system_prompt=ROTATION_STRATEGY_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=RotationStrategyResult,
+        model=model,
         max_tokens=8192,
     )
 
@@ -743,13 +797,23 @@ async def _run_rotation_strategy(
         },
     )
 
-    rotation = ISTRotationStrategy(
-        screen_id=screen.id,
-        phase_allocations=json.dumps([pa.model_dump() for pa in result.phase_allocations]),
-        rotation_triggers=json.dumps([rt.model_dump() for rt in result.rotation_triggers]),
-        risk_limits=json.dumps([rl.model_dump() for rl in result.risk_limits]),
+    existing_rotation = (
+        db.query(ISTRotationStrategy)
+        .filter(ISTRotationStrategy.screen_id == screen.id)
+        .first()
     )
-    db.add(rotation)
+    if existing_rotation:
+        existing_rotation.phase_allocations = json.dumps([pa.model_dump() for pa in result.phase_allocations])
+        existing_rotation.rotation_triggers = json.dumps([rt.model_dump() for rt in result.rotation_triggers])
+        existing_rotation.risk_limits = json.dumps([rl.model_dump() for rl in result.risk_limits])
+    else:
+        rotation = ISTRotationStrategy(
+            screen_id=screen.id,
+            phase_allocations=json.dumps([pa.model_dump() for pa in result.phase_allocations]),
+            rotation_triggers=json.dumps([rt.model_dump() for rt in result.rotation_triggers]),
+            risk_limits=json.dumps([rl.model_dump() for rl in result.risk_limits]),
+        )
+        db.add(rotation)
     screen.updated_at = datetime.now(timezone.utc)
     db.commit()
 
@@ -772,11 +836,13 @@ async def handle_rotation_strategy(workflow_run_id: int) -> dict | None:
         )
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        model = await get_step_model_tier(workflow_run_id, "rotation_strategy")
         return await _run_rotation_strategy(
             db,
             screen,
             workflow_run_id,
             update_screen_status=True,
+            model=model,
         )
     finally:
         db.close()
@@ -788,6 +854,7 @@ async def _run_catalyst_calendar(
     workflow_run_id: int,
     *,
     update_screen_status: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core catalyst-calendar logic reusable by IST and IST_REFRESH."""
     if update_screen_status:
@@ -807,7 +874,39 @@ async def _run_catalyst_calendar(
 
     data_package = _build_full_data_package(db, screen.id)
 
+    # Optionally enrich with verified upcoming events from Perplexity
+    verified_events_block = ""
+    if perplexity_available():
+        try:
+            candidates = (
+                db.query(ISTEquityCandidate)
+                .filter(ISTEquityCandidate.screen_id == screen.id)
+                .all()
+            )
+            tickers = ", ".join(c.ticker for c in candidates[:10])
+            pplx = await search_and_analyze(
+                system_prompt=(
+                    "You are a financial events researcher. For each ticker, "
+                    "find upcoming earnings dates, product launch dates, "
+                    "regulatory decision dates, and other material events. "
+                    "Provide specific dates where available."
+                ),
+                user_prompt=(
+                    f"Find upcoming catalysts and events for these tickers: {tickers}"
+                ),
+                model="sonar",
+                max_tokens=4096,
+                workflow_run_id=workflow_run_id,
+            )
+            verified_events_block = (
+                f"<verified_upcoming_events>\n{pplx.content}\n</verified_upcoming_events>\n\n"
+            )
+            logger.info("Perplexity catalyst enrichment: %d citations", len(pplx.citations))
+        except Exception:
+            logger.warning("Perplexity catalyst enrichment failed, continuing without", exc_info=True)
+
     user_prompt = (
+        f"{verified_events_block}"
         f"{data_package}\n\n"
         f"Generate a dated catalyst timeline for all equity candidates.\n"
         f"Include catalysts from bottleneck resolution triggers, temporal markers, "
@@ -820,6 +919,7 @@ async def _run_catalyst_calendar(
         system_prompt=CATALYST_CALENDAR_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=CatalystCalendarResult,
+        model=model,
         max_tokens=8192,
     )
 
@@ -838,13 +938,23 @@ async def _run_catalyst_calendar(
         sorted_catalysts = sorted(result.catalysts, key=lambda c: c.date)
         next_date = sorted_catalysts[0].date
 
-    calendar = ISTCatalystCalendar(
-        screen_id=screen.id,
-        catalysts=json.dumps([cat.model_dump() for cat in result.catalysts]),
-        total_catalysts=len(result.catalysts),
-        next_catalyst_date=next_date,
+    existing_calendar = (
+        db.query(ISTCatalystCalendar)
+        .filter(ISTCatalystCalendar.screen_id == screen.id)
+        .first()
     )
-    db.add(calendar)
+    if existing_calendar:
+        existing_calendar.catalysts = json.dumps([cat.model_dump() for cat in result.catalysts])
+        existing_calendar.total_catalysts = len(result.catalysts)
+        existing_calendar.next_catalyst_date = next_date
+    else:
+        calendar = ISTCatalystCalendar(
+            screen_id=screen.id,
+            catalysts=json.dumps([cat.model_dump() for cat in result.catalysts]),
+            total_catalysts=len(result.catalysts),
+            next_catalyst_date=next_date,
+        )
+        db.add(calendar)
     screen.updated_at = datetime.now(timezone.utc)
     db.commit()
 
@@ -866,11 +976,13 @@ async def handle_catalyst_calendar(workflow_run_id: int) -> dict | None:
         )
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        model = await get_step_model_tier(workflow_run_id, "catalyst_calendar")
         return await _run_catalyst_calendar(
             db,
             screen,
             workflow_run_id,
             update_screen_status=True,
+            model=model,
         )
     finally:
         db.close()
@@ -882,6 +994,7 @@ async def _run_stress_tests(
     workflow_run_id: int,
     *,
     update_screen_status: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core stress-test logic reusable by IST and IST_REFRESH."""
     if update_screen_status:
@@ -901,7 +1014,34 @@ async def _run_stress_tests(
 
     data_package = _build_full_data_package(db, screen.id)
 
+    # Optionally enrich with current market conditions from Perplexity
+    market_conditions_block = ""
+    if perplexity_available():
+        try:
+            pplx = await search_and_analyze(
+                system_prompt=(
+                    "You are a macro market analyst. Provide current market conditions "
+                    "that are relevant for stress testing investment theses. Include "
+                    "specific current values."
+                ),
+                user_prompt=(
+                    "What are the current values for: VIX index, Federal Funds rate, "
+                    "10-year Treasury yield, S&P 500 YTD performance, and what are "
+                    "the major macro risks being discussed in financial markets right now?"
+                ),
+                model="sonar",
+                max_tokens=4096,
+                workflow_run_id=workflow_run_id,
+            )
+            market_conditions_block = (
+                f"<current_market_conditions>\n{pplx.content}\n</current_market_conditions>\n\n"
+            )
+            logger.info("Perplexity market conditions enrichment: %d citations", len(pplx.citations))
+        except Exception:
+            logger.warning("Perplexity market conditions enrichment failed, continuing without", exc_info=True)
+
     user_prompt = (
+        f"{market_conditions_block}"
         f"{data_package}\n\n"
         f"Perform comprehensive stress tests on this investment thesis.\n"
         f"Include framework-level macro scenarios, name-level equity-specific tests, "
@@ -914,6 +1054,7 @@ async def _run_stress_tests(
         system_prompt=STRESS_TEST_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=StressTestResult,
+        model=model,
         max_tokens=16384,
     )
 
@@ -927,13 +1068,23 @@ async def _run_stress_tests(
         },
     )
 
-    stress = ISTStressTest(
-        screen_id=screen.id,
-        framework_tests=json.dumps([ft.model_dump() for ft in result.framework_tests]),
-        name_tests=json.dumps([nt.model_dump() for nt in result.name_tests]),
-        survival_scores=json.dumps([ss.model_dump() for ss in result.survival_scores]),
+    existing_stress = (
+        db.query(ISTStressTest)
+        .filter(ISTStressTest.screen_id == screen.id)
+        .first()
     )
-    db.add(stress)
+    if existing_stress:
+        existing_stress.framework_tests = json.dumps([ft.model_dump() for ft in result.framework_tests])
+        existing_stress.name_tests = json.dumps([nt.model_dump() for nt in result.name_tests])
+        existing_stress.survival_scores = json.dumps([ss.model_dump() for ss in result.survival_scores])
+    else:
+        stress = ISTStressTest(
+            screen_id=screen.id,
+            framework_tests=json.dumps([ft.model_dump() for ft in result.framework_tests]),
+            name_tests=json.dumps([nt.model_dump() for nt in result.name_tests]),
+            survival_scores=json.dumps([ss.model_dump() for ss in result.survival_scores]),
+        )
+        db.add(stress)
     screen.updated_at = datetime.now(timezone.utc)
     db.commit()
 
@@ -956,11 +1107,13 @@ async def handle_stress_tests(workflow_run_id: int) -> dict | None:
         )
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        model = await get_step_model_tier(workflow_run_id, "stress_tests")
         return await _run_stress_tests(
             db,
             screen,
             workflow_run_id,
             update_screen_status=True,
+            model=model,
         )
     finally:
         db.close()
@@ -972,6 +1125,7 @@ async def _run_report_generation(
     workflow_run_id: int,
     *,
     update_screen_status: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core report-generation logic reusable by IST and IST_REFRESH."""
     if update_screen_status:
@@ -1059,6 +1213,7 @@ async def _run_report_generation(
     report_content = await call_claude_raw(
         system_prompt=REPORT_GENERATION_SYSTEM_PROMPT,
         user_prompt=user_prompt,
+        model=model,
         max_tokens=16384,
     )
 
@@ -1100,13 +1255,24 @@ async def _run_report_generation(
     })
 
     title = f"Investment Thesis Report: {screen.name}"
-    report = ISTReport(
-        screen_id=screen.id,
-        title=title,
-        content=report_content,
-        report_metadata=report_metadata,
+    existing_report = (
+        db.query(ISTReport)
+        .filter(ISTReport.screen_id == screen.id)
+        .first()
     )
-    db.add(report)
+    if existing_report:
+        existing_report.title = title
+        existing_report.content = report_content
+        existing_report.report_metadata = report_metadata
+        existing_report.created_at = datetime.now(timezone.utc)
+    else:
+        report = ISTReport(
+            screen_id=screen.id,
+            title=title,
+            content=report_content,
+            report_metadata=report_metadata,
+        )
+        db.add(report)
     screen.updated_at = datetime.now(timezone.utc)
     db.commit()
 
@@ -1130,23 +1296,34 @@ async def handle_report_generation(workflow_run_id: int) -> dict | None:
         )
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
+        model = await get_step_model_tier(workflow_run_id, "report_generation")
         return await _run_report_generation(
             db,
             screen,
             workflow_run_id,
             update_screen_status=True,
+            model=model,
         )
     finally:
         db.close()
 
 
-def _bottleneck_name_in_report(name: str, content: str) -> tuple[bool, list[str]]:
+def _bottleneck_name_in_report(
+    name: str, content: str, *, coverage_threshold: float = 0.6
+) -> tuple[bool, list[str]]:
     """Fuzzy check whether a bottleneck name is covered in the report.
 
     Splits the bottleneck name into "key words" (length >= 4 chars),
     lowercases everything, and checks what fraction of key words appear
-    anywhere in the report content.  A bottleneck passes if >= 60% of its
-    key words are found.
+    anywhere in the report content.  A bottleneck passes if >=
+    *coverage_threshold* of its key words are found (default 60%).
+
+    Args:
+        name: Bottleneck name to check.
+        content: Report content to search in.
+        coverage_threshold: Fraction (0.0-1.0) of key words required.
+            Defaults to 0.6 (60%).  Can be lowered for qualitative content
+            types via CONTENT_TYPE_THRESHOLDS.
 
     Returns:
         (passed, missing_words) -- *missing_words* is the list of key words
@@ -1164,7 +1341,7 @@ def _bottleneck_name_in_report(name: str, content: str) -> tuple[bool, list[str]
     content_lower = content.lower()
     missing = [w for w in key_words if w not in content_lower]
     found_count = len(key_words) - len(missing)
-    threshold = math.ceil(len(key_words) * 0.6)
+    threshold = math.ceil(len(key_words) * coverage_threshold)
     passed = found_count >= threshold
     return (passed, missing)
 
@@ -1247,6 +1424,8 @@ async def handle_screen_coherence_gate(workflow_run_id: int) -> dict | None:
                     )
 
         # Check 4: All bottleneck names appear in the report content (fuzzy)
+        # Use content-type-aware keyword coverage threshold
+        bn_threshold = get_thresholds(screen.content_type)["bottleneck_kw"]
         bottlenecks = (
             db.query(ISTBottleneck)
             .filter(ISTBottleneck.screen_id == screen.id)
@@ -1255,7 +1434,7 @@ async def handle_screen_coherence_gate(workflow_run_id: int) -> dict | None:
         if report and report.content:
             for bn in bottlenecks:
                 passed, missing = _bottleneck_name_in_report(
-                    bn.name, report.content
+                    bn.name, report.content, coverage_threshold=bn_threshold
                 )
                 if not passed:
                     missing_str = ", ".join(missing) if missing else bn.name
@@ -1311,8 +1490,8 @@ async def handle_screen_coherence_gate(workflow_run_id: int) -> dict | None:
             if required_side not in existing_sides:
                 deficiencies.append(f"Dialectic review '{required_side}' does not exist")
 
-        # Check 10: All 5 core invariants pass
-        invariant_results = _run_invariant_checks(db, screen.id)
+        # Check 10: All 5 core invariants pass (content-type-aware)
+        invariant_results = _run_invariant_checks(db, screen.id, content_type=screen.content_type)
         failed_invariants = [
             inv for inv in invariant_results if inv["status"] == "FAIL"
         ]
@@ -1399,7 +1578,7 @@ async def _run_screen_certification(
         .filter(ISTMasterScreen.screen_id == screen.id)
         .first()
     )
-    invariant_results = _run_invariant_checks(db, screen.id)
+    invariant_results = _run_invariant_checks(db, screen.id, content_type=screen.content_type)
     invariants_passed = sum(1 for inv in invariant_results if inv["status"] == "PASS")
     invariants_failed = sum(1 for inv in invariant_results if inv["status"] == "FAIL")
 
@@ -1496,22 +1675,19 @@ async def _run_hfrt_handoff_generation(
         "step_progress",
         {
             "stepName": "hfrt_handoff_generation",
-            "message": "Building HFRT handoff from Tier 1 candidates...",
+            "message": "Building HFRT handoff from all candidates...",
             "percent": 20,
         },
     )
 
-    tier1_candidates = (
+    all_candidates = (
         db.query(ISTEquityCandidate)
-        .filter(
-            ISTEquityCandidate.screen_id == screen.id,
-            ISTEquityCandidate.tier == 1,
-        )
-        .order_by(ISTEquityCandidate.id)
+        .filter(ISTEquityCandidate.screen_id == screen.id)
+        .order_by(ISTEquityCandidate.tier, ISTEquityCandidate.id)
         .all()
     )
 
-    bn_ids = {c.bottleneck_id for c in tier1_candidates if c.bottleneck_id}
+    bn_ids = {c.bottleneck_id for c in all_candidates if c.bottleneck_id}
     bn_map = {}
     if bn_ids:
         bns = (
@@ -1522,7 +1698,7 @@ async def _run_hfrt_handoff_generation(
         bn_map = {bn.id: bn.name for bn in bns}
 
     handoff_candidates = []
-    for cand in tier1_candidates:
+    for cand in all_candidates:
         scarcity_val = None
         if cand.scarcity_score:
             try:
@@ -1540,11 +1716,17 @@ async def _run_hfrt_handoff_generation(
             "scarcityScore": scarcity_val,
         })
 
+    tier1_count = sum(1 for c in handoff_candidates if c["tier"] == 1)
+    tier2_count = sum(1 for c in handoff_candidates if c["tier"] == 2)
+    tier3_count = sum(1 for c in handoff_candidates if c["tier"] == 3)
+
     handoff_data = {
         "screenName": screen.name,
         "screenId": screen.id,
         "certifiedAt": screen.certified_at.isoformat() if screen.certified_at else None,
-        "tier1Count": len(handoff_candidates),
+        "tier1Count": tier1_count,
+        "totalCount": len(handoff_candidates),
+        "tierBreakdown": {"tier1": tier1_count, "tier2": tier2_count, "tier3": tier3_count},
         "candidates": handoff_candidates,
     }
 

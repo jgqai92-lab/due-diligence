@@ -17,7 +17,9 @@ Analyze the industry for the given company with deep sector expertise:
 11. **End-market diversification**: Revenue by vertical, geographic mix, government vs commercial
 12. **Capital allocation**: M&A track record (deal ROIC), integration execution, organic vs inorganic growth
 
-NEVER fabricate data. Cite sources where possible. Return ONLY valid JSON matching the schema."""
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate backlog figures, cycle indicators, or end-market details not present in the provided context.
+Return ONLY valid JSON matching the schema."""
 
 KPIS = [
     "Book-to-Bill Ratio",

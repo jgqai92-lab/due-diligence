@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.database import SessionLocal
 from app.models.hfrt import HFRTProject, HFRTTemplate, HFRTDialecticReview
-from app.services.claude_client import call_claude
+from app.services.claude_client import call_claude, get_step_model_tier
 from app.services.workflow_engine import register_step, emit_sse_event
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,10 @@ You must:
 
 IMPORTANT: You are building the BULL case only. Focus on upside potential, positive catalysts, and reasons the market is too pessimistic. Do NOT present a balanced view — that's the synthesizer's job.
 
-NEVER fabricate data. Use only provided research data.
+ISOLATION REQUIREMENT: You have NOT seen the opposing bear case. Do NOT reference, anticipate, or pre-emptively rebut the other side's arguments. Build your case solely from the research data provided.
+
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate catalysts, price targets, or financial projections not supported by the provided data.
 Return ONLY valid JSON matching the schema provided."""
 
 BEAR_SYSTEM_PROMPT = """You are a bear-case equity analyst. Your job is to build the STRONGEST POSSIBLE case AGAINST this investment.
@@ -65,7 +68,10 @@ You must:
 
 IMPORTANT: You are building the BEAR case only. Focus on downside risks, negative catalysts, and reasons the market is too optimistic. Do NOT present a balanced view — that's the synthesizer's job.
 
-NEVER fabricate data. Use only provided research data.
+ISOLATION REQUIREMENT: You have NOT seen the opposing bull case. Do NOT reference, anticipate, or pre-emptively rebut the other side's arguments. Build your case solely from the research data provided.
+
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate negative catalysts, price targets, or competitive threats not supported by the provided data.
 Return ONLY valid JSON matching the schema provided."""
 
 
@@ -130,10 +136,12 @@ async def handle_bull_case(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {DialecticCaseResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "bull_case")
         result = await call_claude(
             system_prompt=BULL_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=DialecticCaseResult,
+            model=model,
             max_tokens=12288,
         )
 
@@ -189,10 +197,12 @@ async def handle_bear_case(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {DialecticCaseResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "bear_case")
         result = await call_claude(
             system_prompt=BEAR_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=DialecticCaseResult,
+            model=model,
             max_tokens=12288,
         )
 

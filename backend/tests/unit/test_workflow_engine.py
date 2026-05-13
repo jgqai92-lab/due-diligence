@@ -38,6 +38,16 @@ from app.services.workflow_engine import (
     _active_workflows,
     register_step,
     emit_sse_event,
+    subscribe_sse,
+    unsubscribe_sse,
+    start_workflow,
+    retry_workflow,
+    cancel_workflow,
+    pause_workflow,
+    get_active_workflow_count,
+    is_workflow_orphaned,
+    MAX_SSE_CONNECTIONS_PER_WORKFLOW,
+    MAX_ACTIVE_WORKFLOWS,
 )
 
 
@@ -884,3 +894,307 @@ class TestCurrentPhaseTracking:
         assert run.status == "COMPLETED"
         assert run.current_phase == 2
         assert run.current_phase_name == "Phase Two"
+
+
+class TestSSESubscription:
+    """Tests for subscribe_sse / unsubscribe_sse."""
+
+    def test_subscribe_returns_queue(self):
+        queue = subscribe_sse(9999)
+        try:
+            assert isinstance(queue, asyncio.Queue)
+            assert 9999 in _sse_queues
+        finally:
+            unsubscribe_sse(9999, queue)
+
+    def test_unsubscribe_removes_queue(self):
+        q = subscribe_sse(9998)
+        unsubscribe_sse(9998, q)
+        assert 9998 not in _sse_queues
+
+    def test_unsubscribe_nonexistent_queue_safe(self):
+        q = asyncio.Queue()
+        unsubscribe_sse(12345, q)  # Should not raise
+
+    def test_max_connections_enforced(self):
+        wid = 9997
+        queues = []
+        try:
+            for _ in range(MAX_SSE_CONNECTIONS_PER_WORKFLOW):
+                queues.append(subscribe_sse(wid))
+            with pytest.raises(ValueError, match="Maximum SSE connections"):
+                subscribe_sse(wid)
+        finally:
+            for q in queues:
+                unsubscribe_sse(wid, q)
+
+
+class TestWorkflowLifecycle:
+    """Tests for start, pause, cancel, retry lifecycle functions."""
+
+    @pytest.mark.asyncio
+    async def test_start_workflow_creates_task(self, db_session):
+        wid = _create_workflow(db_session)
+        _create_step(db_session, wid, "s1", 1, "P1", 1, depends_on=[])
+        _step_registry[("IST", "s1")] = _make_handler("s1")
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await start_workflow(wid)
+            # Task should be registered
+            assert wid in _active_workflows
+            # Wait for it to complete
+            await _active_workflows[wid]
+
+        db_session.expire_all()
+        run = db_session.query(WorkflowRun).filter(WorkflowRun.id == wid).first()
+        assert run.status == "COMPLETED"
+
+    @pytest.mark.asyncio
+    async def test_start_duplicate_raises(self, db_session):
+        wid = _create_workflow(db_session)
+        _create_step(db_session, wid, "slow", 1, "P1", 1, depends_on=[])
+        _step_registry[("IST", "slow")] = _make_handler("slow", duration=2.0)
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await start_workflow(wid)
+            with pytest.raises(ValueError, match="already running"):
+                await start_workflow(wid)
+            # Clean up
+            task = _active_workflows.get(wid)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    @pytest.mark.asyncio
+    async def test_cancel_workflow(self, db_session):
+        wid = _create_workflow(db_session, status="RUNNING")
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await cancel_workflow(wid)
+
+        db_session.expire_all()
+        run = db_session.query(WorkflowRun).filter(WorkflowRun.id == wid).first()
+        assert run.status == "CANCELLED"
+
+    @pytest.mark.asyncio
+    async def test_pause_workflow(self, db_session):
+        wid = _create_workflow(db_session, status="RUNNING")
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await pause_workflow(wid)
+
+        db_session.expire_all()
+        run = db_session.query(WorkflowRun).filter(WorkflowRun.id == wid).first()
+        assert run.status == "PAUSED"
+
+    @pytest.mark.asyncio
+    async def test_retry_resets_failed_step(self, db_session):
+        wid = _create_workflow(db_session, status="FAILED")
+        step = _create_step(db_session, wid, "bad", 1, "P1", 1, depends_on=[])
+        step.status = "FAILED"
+        step.error_message = "Some error"
+        db_session.commit()
+
+        _step_registry[("IST", "bad")] = _make_handler("bad")
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await retry_workflow(wid)
+            # Wait for the workflow task to complete
+            task = _active_workflows.get(wid)
+            if task:
+                await task
+
+        db_session.expire_all()
+        run = db_session.query(WorkflowRun).filter(WorkflowRun.id == wid).first()
+        assert run.status == "COMPLETED"
+        step = db_session.query(WorkflowStep).filter(WorkflowStep.id == step.id).first()
+        assert step.status == "COMPLETED"
+
+    @pytest.mark.asyncio
+    async def test_retry_non_retryable_raises(self, db_session):
+        """COMPLETED workflows cannot be retried."""
+        wid = _create_workflow(db_session, status="COMPLETED")
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            with pytest.raises(ValueError, match="Cannot retry"):
+                await retry_workflow(wid)
+
+    @pytest.mark.asyncio
+    async def test_retry_smart_resets_parents(self, db_session):
+        """Gate steps with retry_strategy='with_parent' also reset parent steps."""
+        wid = _create_workflow(db_session, status="FAILED")
+
+        parent = _create_step(
+            db_session, wid, "parent_step", 1, "P1", 1, depends_on=[],
+        )
+        parent.status = "COMPLETED"
+        parent.output_data = '{"old": "data"}'
+        db_session.commit()
+
+        gate = _create_step(
+            db_session, wid, "gate_step", 1, "P1", 2,
+            depends_on=["parent_step"],
+        )
+        gate.status = "FAILED"
+        gate.error_message = "Gate check failed"
+        gate.retry_strategy = "with_parent"
+        db_session.commit()
+
+        _step_registry[("IST", "parent_step")] = _make_handler("parent_step")
+        _step_registry[("IST", "gate_step")] = _make_handler("gate_step")
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await retry_workflow(wid)
+            task = _active_workflows.get(wid)
+            if task:
+                await task
+
+        db_session.expire_all()
+        parent = db_session.query(WorkflowStep).filter(WorkflowStep.id == parent.id).first()
+        assert parent.status == "COMPLETED"
+        # Output should be regenerated (not the old data)
+        gate = db_session.query(WorkflowStep).filter(WorkflowStep.id == gate.id).first()
+        assert gate.status == "COMPLETED"
+
+    def test_get_active_workflow_count(self):
+        _active_workflows.clear()
+        assert get_active_workflow_count() == 0
+        _active_workflows[1] = MagicMock()
+        assert get_active_workflow_count() == 1
+        _active_workflows.clear()
+
+    def test_is_workflow_orphaned(self):
+        """is_workflow_orphaned returns True when no asyncio task exists."""
+        _active_workflows.clear()
+        assert is_workflow_orphaned(999) is True
+        _active_workflows[999] = MagicMock()
+        assert is_workflow_orphaned(999) is False
+        _active_workflows.clear()
+
+    @pytest.mark.asyncio
+    async def test_retry_orphaned_running_workflow(self, db_session):
+        """Orphaned RUNNING workflow recovers and completes on retry."""
+        wid = _create_workflow(db_session, status="RUNNING")
+        step1 = _create_step(
+            db_session, wid, "done_step", 1, "P1", 1, depends_on=[],
+        )
+        step1.status = "COMPLETED"
+        step1.started_at = datetime.now(timezone.utc)
+        step1.completed_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+        step2 = _create_step(
+            db_session, wid, "stuck_step", 1, "P1", 2,
+            depends_on=["done_step"],
+        )
+        step2.status = "RUNNING"
+        step2.started_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+        _step_registry[("IST", "done_step")] = _make_handler("done_step")
+        _step_registry[("IST", "stuck_step")] = _make_handler("stuck_step")
+
+        # Ensure workflow is NOT in _active_workflows (orphaned)
+        _active_workflows.pop(wid, None)
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await retry_workflow(wid)
+            task = _active_workflows.get(wid)
+            if task:
+                await task
+
+        db_session.expire_all()
+        run = db_session.query(WorkflowRun).filter(WorkflowRun.id == wid).first()
+        assert run.status == "COMPLETED"
+        s1 = db_session.query(WorkflowStep).filter(WorkflowStep.id == step1.id).first()
+        assert s1.status == "COMPLETED"
+        s2 = db_session.query(WorkflowStep).filter(WorkflowStep.id == step2.id).first()
+        assert s2.status == "COMPLETED"
+
+    @pytest.mark.asyncio
+    async def test_retry_actively_running_raises(self, db_session):
+        """Genuinely running workflow rejects retry attempt."""
+        wid = _create_workflow(db_session, status="RUNNING")
+        # Simulate an active task
+        _active_workflows[wid] = MagicMock()
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            with pytest.raises(ValueError, match="actively running"):
+                await retry_workflow(wid)
+
+        _active_workflows.pop(wid, None)
+
+    @pytest.mark.asyncio
+    async def test_retry_orphaned_preserves_completed_steps(self, db_session):
+        """Completed steps are not reset when recovering an orphaned workflow."""
+        wid = _create_workflow(db_session, status="RUNNING")
+        step1 = _create_step(
+            db_session, wid, "completed_step", 1, "P1", 1, depends_on=[],
+        )
+        step1.status = "COMPLETED"
+        step1.output_data = '{"result": "keep_me"}'
+        step1.started_at = datetime.now(timezone.utc)
+        step1.completed_at = datetime.now(timezone.utc)
+        step1.duration_ms = 1234
+        db_session.commit()
+
+        step2 = _create_step(
+            db_session, wid, "orphan_step", 1, "P1", 2,
+            depends_on=["completed_step"],
+        )
+        step2.status = "RUNNING"
+        step2.started_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+        _step_registry[("IST", "completed_step")] = _make_handler("completed_step")
+        _step_registry[("IST", "orphan_step")] = _make_handler("orphan_step")
+
+        _active_workflows.pop(wid, None)
+
+        with patch("app.services.workflow_engine.SessionLocal", TestSessionLocal):
+            await retry_workflow(wid)
+            task = _active_workflows.get(wid)
+            if task:
+                await task
+
+        db_session.expire_all()
+        s1 = db_session.query(WorkflowStep).filter(WorkflowStep.id == step1.id).first()
+        assert s1.status == "COMPLETED"
+        assert s1.output_data == '{"result": "keep_me"}'
+        assert s1.duration_ms == 1234
+
+
+class TestEmitSSEEvent:
+    """Tests for emit_sse_event."""
+
+    @pytest.mark.asyncio
+    async def test_event_broadcast_to_subscribers(self):
+        q = subscribe_sse(8888)
+        try:
+            await emit_sse_event(8888, "test_event", {"key": "value"})
+            event = q.get_nowait()
+            assert event["type"] == "test_event"
+            assert event["key"] == "value"
+            assert "timestamp" in event
+        finally:
+            unsubscribe_sse(8888, q)
+
+    @pytest.mark.asyncio
+    async def test_emit_to_no_subscribers(self):
+        # Should not raise
+        await emit_sse_event(7777, "test", {"data": 1})
+
+    @pytest.mark.asyncio
+    async def test_full_queue_drops_event(self):
+        q = subscribe_sse(6666)
+        try:
+            # Fill the queue to capacity
+            for i in range(100):
+                q.put_nowait({"type": "filler", "i": i})
+            # This should log a warning but not raise
+            await emit_sse_event(6666, "overflow", {})
+            assert q.qsize() == 100  # No new event added
+        finally:
+            unsubscribe_sse(6666, q)

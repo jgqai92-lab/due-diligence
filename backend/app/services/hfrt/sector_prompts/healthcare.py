@@ -17,7 +17,9 @@ Analyze the industry for the given company with deep sector expertise:
 11. **M&A activity**: Bolt-on vs transformational, licensing deals, collaboration economics
 12. **ESG/Access**: Drug pricing scrutiny, patient access programs, 340B exposure
 
-NEVER fabricate data. Cite sources where possible. Return ONLY valid JSON matching the schema."""
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate pipeline valuations, clinical trial results, regulatory approvals, or payer details not present in the provided context.
+Return ONLY valid JSON matching the schema."""
 
 KPIS = [
     "Pipeline value (risk-adjusted NPV)",

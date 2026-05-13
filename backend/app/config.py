@@ -20,8 +20,11 @@ class Settings(BaseSettings):
         "http://localhost:3002", "http://127.0.0.1:3002",
         "http://localhost:3003", "http://127.0.0.1:3003",
     ]
-    claude_model: str = "claude-sonnet-4-20250514"
-    claude_timeout: int = 120
+    claude_model: str = "claude-sonnet-4-6"
+    claude_timeout: int = 300
+    perplexity_api_key: str = ""
+    perplexity_model: str = "sonar"
+    perplexity_timeout: int = 60
     sec_edgar_user_agent: str = "SkepticalAnalyst research@example.com"
 
     model_config = {"env_file": str(ENV_FILE), "env_file_encoding": "utf-8"}

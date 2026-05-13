@@ -17,7 +17,8 @@ from app.models.ist import (
     ISTScreen,
     ISTValidation,
 )
-from app.services.ist.claude_client import call_claude
+from app.services.ist.claude_client import call_claude, get_step_model_tier
+from app.services.perplexity_client import is_available as perplexity_available, search_and_analyze
 from app.services.workflow_engine import emit_sse_event, register_step
 
 logger = logging.getLogger(__name__)
@@ -70,16 +71,19 @@ class EffectsResult(BaseModel):
 EQUITY_SCANNING_SYSTEM_PROMPT = """You are an investment research analyst identifying equity candidates that benefit from temporal scarcity bottlenecks.
 
 Your task:
-1. For each bottleneck provided, identify publicly-traded companies that benefit
+1. For each bottleneck provided, identify 2-4 publicly-traded companies that benefit
 2. For each company, assess the five scarcity dimensions on a 1-5 scale:
    - supply_constraint: How constrained is the supply chain? (5 = severely constrained)
    - demand_visibility: How visible/certain is the demand? (5 = highly visible)
    - substitution_difficulty: How hard is it to substitute? (5 = no substitutes)
    - pricing_power: How much pricing power does the company have? (5 = monopoly-like)
    - temporal_urgency: How time-sensitive is the opportunity? (5 = urgent window)
-3. Identify the moat type and evidence for each candidate
-4. Identify near-term catalysts
+3. Identify the moat type and evidence (1-2 sentences max) for each candidate
+4. Identify near-term catalysts (1 sentence max)
 5. Assign conviction (HIGH, MEDIUM, or LOW)
+
+IMPORTANT: Keep output CONCISE. Limit to 15 candidates total across all bottlenecks.
+Use short strings for thesis (1 sentence), moat_evidence (1-2 sentences), and catalysts (1 sentence).
 
 NEVER fabricate ticker symbols or company names. Only identify real, publicly-traded companies. If you cannot identify companies for a bottleneck, return an empty list for that bottleneck. Use only information derivable from the bottleneck and claim data provided.
 
@@ -109,6 +113,7 @@ async def _run_equity_scanning(
     *,
     update_screen_status: bool = True,
     replace_artifact: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core equity-scanning logic for IST and IST_REFRESH."""
     if update_screen_status:
@@ -145,7 +150,36 @@ async def _run_equity_scanning(
         for c in claims
     )
 
+    # Optionally enrich with current market data from Perplexity
+    market_verification_block = ""
+    if perplexity_available():
+        try:
+            bn_names = ", ".join(bn.name for bn in bottlenecks[:5])
+            pplx = await search_and_analyze(
+                system_prompt=(
+                    "You are a market research analyst. For the given bottleneck themes, "
+                    "identify publicly traded companies that are key beneficiaries. "
+                    "For each company, provide: ticker symbol, current market cap, "
+                    "and one sentence on why they benefit. Verify tickers are real "
+                    "and currently trading on major US exchanges."
+                ),
+                user_prompt=(
+                    f"Find publicly traded companies that benefit from these "
+                    f"investment themes: {bn_names}"
+                ),
+                model="sonar",
+                max_tokens=4096,
+                workflow_run_id=workflow_run_id,
+            )
+            market_verification_block = (
+                f"<verified_market_data>\n{pplx.content}\n</verified_market_data>\n\n"
+            )
+            logger.info("Perplexity equity verification: %d citations", len(pplx.citations))
+        except Exception:
+            logger.warning("Perplexity equity verification failed, continuing without", exc_info=True)
+
     user_prompt = (
+        f"{market_verification_block}"
         f"<bottlenecks>\n{bottleneck_text}\n</bottlenecks>\n\n"
         f"<claims>\n{claims_text}\n</claims>\n\n"
         f"Identify equity candidates that benefit from these {len(bottlenecks)} bottlenecks.\n"
@@ -156,6 +190,8 @@ async def _run_equity_scanning(
         system_prompt=EQUITY_SCANNING_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=EquityScanResult,
+        model=model,
+        max_tokens=16384,
     )
 
     await emit_sse_event(
@@ -171,7 +207,15 @@ async def _run_equity_scanning(
     name_to_bottleneck: dict[str, ISTBottleneck] = {bn.name: bn for bn in bottlenecks}
 
     stored_count = 0
+    seen_tickers: set[str] = set()
     for cand_data in result.candidates:
+        # Deduplicate: UNIQUE constraint on (screen_id, ticker)
+        ticker_upper = cand_data.ticker.strip().upper()
+        if ticker_upper in seen_tickers:
+            logger.info("Skipping duplicate ticker '%s'", ticker_upper)
+            continue
+        seen_tickers.add(ticker_upper)
+
         matched_bn = name_to_bottleneck.get(cand_data.bottleneck_name)
         if matched_bn is None:
             logger.warning(
@@ -322,6 +366,7 @@ async def _run_effects_analysis(
     workflow_run_id: int,
     *,
     replace_artifact: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core effects-analysis logic for IST and IST_REFRESH."""
     await emit_sse_event(
@@ -368,6 +413,8 @@ async def _run_effects_analysis(
         system_prompt=EFFECTS_ANALYSIS_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=EffectsResult,
+        model=model,
+        max_tokens=16384,
     )
 
     await emit_sse_event(
@@ -441,12 +488,14 @@ async def handle_equity_scanning(workflow_run_id: int) -> dict | None:
             .all()
         )
 
+        model = await get_step_model_tier(workflow_run_id, "equity_scanning")
         return await _run_equity_scanning(
             screen,
             bottlenecks,
             claims,
             db,
             workflow_run_id,
+            model=model,
         )
     finally:
         db.close()
@@ -503,12 +552,14 @@ async def handle_effects_analysis(workflow_run_id: int) -> dict | None:
             .all()
         )
 
+        model = await get_step_model_tier(workflow_run_id, "effects_analysis")
         return await _run_effects_analysis(
             screen,
             bottlenecks,
             candidates,
             db,
             workflow_run_id,
+            model=model,
         )
     finally:
         db.close()

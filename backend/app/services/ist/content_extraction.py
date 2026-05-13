@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models.ist import ISTClaim, ISTScreen
 from app.schemas.ist import ContentExtractionSummary, SourceBiasSummary
-from app.services.ist.claude_client import call_claude
+from app.services.ist.claude_client import call_claude, get_step_model_tier
 from app.services.workflow_engine import emit_sse_event, register_step
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,7 @@ async def _run_content_extraction(
     claim_source_refresh_id: Optional[int] = None,
     update_screen_status: bool = True,
     replace_claims: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core extraction logic reusable by IST and IST_REFRESH wrappers."""
     if update_screen_status:
@@ -113,13 +114,19 @@ async def _run_content_extraction(
 
     source_content = raw_content if raw_content is not None else screen.raw_content
 
+    # Derive source date for temporal context
+    source_date = screen.created_at.strftime("%Y-%m-%d") if screen.created_at else None
+
     user_prompt = (
         f"<source_content>\n{source_content}\n</source_content>\n\n"
         f"<metadata>\n"
         f"Content type: {screen.content_type}\n"
         f"Hypothesis: {brief_data.get('hypothesis', 'Not specified')}\n"
-        f"</metadata>\n\n"
+        + (f"Content date: {source_date}\n" if source_date else "")
+        + f"</metadata>\n\n"
         f"Extract all investment-relevant claims from the content above.\n"
+        f"When claims reference dates without an explicit year (e.g., 'February 3rd', "
+        f"'last Monday'), resolve them to absolute dates using the content date above.\n"
         f"Return JSON matching this schema: "
         f"{ContentExtractionResult.model_json_schema()}"
     )
@@ -128,6 +135,7 @@ async def _run_content_extraction(
         system_prompt=EXTRACTION_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=ContentExtractionResult,
+        model=model,
     )
 
     await emit_sse_event(
@@ -184,6 +192,7 @@ async def _run_source_bias(
     *,
     raw_content: Optional[str] = None,
     target_refresh: Optional["ISTScreenRefresh"] = None,
+    model: str | None = None,
 ) -> dict | None:
     """Core source-bias logic reusable by IST and IST_REFRESH wrappers."""
     source_content = raw_content if raw_content is not None else screen.raw_content
@@ -204,6 +213,7 @@ async def _run_source_bias(
         system_prompt=SOURCE_BIAS_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=SourceBiasResult,
+        model=model,
     )
 
     bias_summary = SourceBiasSummary(
@@ -235,7 +245,8 @@ async def handle_content_extraction(workflow_run_id: int) -> dict | None:
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
 
-        return await _run_content_extraction(screen, db, workflow_run_id)
+        model = await get_step_model_tier(workflow_run_id, "content_extraction")
+        return await _run_content_extraction(screen, db, workflow_run_id, model=model)
     finally:
         db.close()
 
@@ -253,6 +264,7 @@ async def handle_source_bias(workflow_run_id: int) -> dict | None:
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
 
-        return await _run_source_bias(screen, db, workflow_run_id)
+        model = await get_step_model_tier(workflow_run_id, "source_bias_assessment")
+        return await _run_source_bias(screen, db, workflow_run_id, model=model)
     finally:
         db.close()

@@ -149,16 +149,18 @@ def create_hfrt_projects(
     # If all tickers failed and there was a screen-level issue, return appropriate error
     if not created and failed:
         # Check if all failures are the same screen-level error (not found, not certified)
-        first_error = failed[0]["error"].lower()
-        if "not found" in first_error:
+        # Distinguish "Screen X not found" from "Ticker X not found in handoff candidates"
+        first_error = failed[0]["error"]
+        first_lower = first_error.lower()
+        if first_lower.startswith("screen") and "not found" in first_lower:
             raise HTTPException(
                 status_code=404,
-                detail=_error("SCREEN_NOT_FOUND", failed[0]["error"]),
+                detail=_error("SCREEN_NOT_FOUND", first_error),
             )
-        elif "not certified" in first_error:
+        elif "not certified" in first_lower:
             raise HTTPException(
                 status_code=400,
-                detail=_error("NOT_CERTIFIED", failed[0]["error"]),
+                detail=_error("NOT_CERTIFIED", first_error),
             )
 
     return {

@@ -14,8 +14,9 @@ from pydantic import BaseModel, Field
 
 from app.database import SessionLocal
 from app.models.hfrt import HFRTProject, HFRTTemplate
-from app.services.claude_client import call_claude
+from app.services.claude_client import call_claude, get_step_model_tier
 from app.services.hfrt.sector_prompts import get_sector_config
+from app.services.perplexity_client import is_available as perplexity_available, search_and_analyze
 from app.services.workflow_engine import register_step, emit_sse_event
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,34 @@ async def handle_industry_analysis(workflow_run_id: int) -> dict | None:
         # Sector-routed prompt (Gap B2, Decision 15)
         sector_config = get_sector_config(project.sector)
 
+        # Optionally enrich with current industry trends from Perplexity
+        industry_trends_block = ""
+        if perplexity_available():
+            try:
+                pplx = await search_and_analyze(
+                    system_prompt=(
+                        "You are an industry analyst. Provide current industry trends, "
+                        "recent regulatory changes, market size updates, and key "
+                        "developments in the given sector."
+                    ),
+                    user_prompt=(
+                        f"Current trends, regulatory changes, and market developments "
+                        f"in the {project.sector or 'Unknown'} sector relevant to "
+                        f"{project.ticker} ({project.company_name})"
+                    ),
+                    model="sonar",
+                    max_tokens=4096,
+                    workflow_run_id=workflow_run_id,
+                )
+                industry_trends_block = (
+                    f"<current_industry_data>\n{pplx.content}\n</current_industry_data>\n\n"
+                )
+                logger.info("Perplexity industry enrichment: %d citations", len(pplx.citations))
+            except Exception:
+                logger.warning("Perplexity industry enrichment failed, continuing without", exc_info=True)
+
         user_prompt = (
+            f"{industry_trends_block}"
             f"<company_overview>\n{json.dumps(overview, indent=2, default=str)[:5000]}\n</company_overview>\n\n"
             f"<business_model>\n{json.dumps(biz_model, indent=2, default=str)[:4000]}\n</business_model>\n\n"
             f"<competitive_position>\n{json.dumps(competitive, indent=2, default=str)[:4000]}\n</competitive_position>\n\n"
@@ -101,10 +129,12 @@ async def handle_industry_analysis(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {IndustryAnalysisResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "industry_analysis")
         result = await call_claude(
             system_prompt=sector_config.system_prompt,
             user_prompt=user_prompt,
             response_model=IndustryAnalysisResult,
+            model=model,
         )
 
         template = (

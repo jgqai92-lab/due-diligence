@@ -1,16 +1,17 @@
 """IST-to-HFRT bridge service -- creates HFRT research projects from certified IST screens.
 
 Bridges the IST Investment Screening workflow to the HFRT Hedge Fund Research workflow.
-Takes Tier 1 equity candidates from a certified IST screen and creates fully initialized
-HFRT deep research projects pre-populated with IST-derived context.
+Takes equity candidates (all tiers) from a certified IST screen and creates fully
+initialized HFRT deep research projects pre-populated with IST-derived context.
 """
 
 import json
 import logging
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.ist import ISTScreen
+from app.models.ist import ISTBottleneck, ISTEquityCandidate, ISTScreen
 from app.models.hfrt import HFRTProject, HFRTTemplate
 from app.models.workflow import WorkflowRun, WorkflowStep
 
@@ -21,12 +22,12 @@ logger = logging.getLogger(__name__)
 
 HFRT_WORKFLOW_STEPS = [
     # Phase 1: Screening
-    {"step_name": "idea_screen", "phase": 1, "phase_name": "Screening", "step_order": 1, "depends_on": [], "model": "opus"},
+    {"step_name": "idea_screen", "phase": 1, "phase_name": "Screening", "step_order": 1, "depends_on": [], "model": "sonnet"},
     # Phase 2: Deep Research
-    {"step_name": "company_overview", "phase": 2, "phase_name": "Deep Research", "step_order": 2, "depends_on": ["idea_screen"], "model": "opus"},
+    {"step_name": "company_overview", "phase": 2, "phase_name": "Deep Research", "step_order": 2, "depends_on": ["idea_screen"], "model": "sonnet"},
     {"step_name": "business_model", "phase": 2, "phase_name": "Deep Research", "step_order": 3, "depends_on": ["company_overview"], "model": "opus"},
-    {"step_name": "competitive_position", "phase": 2, "phase_name": "Deep Research", "step_order": 4, "depends_on": ["company_overview"], "model": "opus"},
-    {"step_name": "industry_analysis", "phase": 2, "phase_name": "Deep Research", "step_order": 5, "depends_on": ["company_overview"], "model": "opus"},
+    {"step_name": "competitive_position", "phase": 2, "phase_name": "Deep Research", "step_order": 4, "depends_on": ["company_overview"], "model": "sonnet"},
+    {"step_name": "industry_analysis", "phase": 2, "phase_name": "Deep Research", "step_order": 5, "depends_on": ["company_overview"], "model": "sonnet"},
     {"step_name": "financial_analysis", "phase": 2, "phase_name": "Deep Research", "step_order": 6, "depends_on": ["business_model"], "model": "sonnet"},
     {"step_name": "valuation", "phase": 2, "phase_name": "Deep Research", "step_order": 7, "depends_on": ["financial_analysis"], "model": "sonnet"},
     {"step_name": "research_sufficiency_gate", "phase": 2, "phase_name": "Deep Research", "step_order": 8, "depends_on": ["valuation", "competitive_position", "industry_analysis"], "model": "none", "retry_strategy": "with_parent"},
@@ -36,18 +37,20 @@ HFRT_WORKFLOW_STEPS = [
     {"step_name": "risk_analysis", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 11, "depends_on": ["fetch_sec_filings"], "model": "opus"},
     {"step_name": "quality_of_earnings", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 12, "depends_on": ["fetch_sec_filings"], "model": "opus"},
     {"step_name": "dd_sufficiency_gate", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 13, "depends_on": ["management_assessment", "risk_analysis", "quality_of_earnings"], "model": "none", "retry_strategy": "with_parent"},
+    # Gap 1: External validation (Perplexity-grounded) — runs in parallel with dialectic
+    {"step_name": "external_validation", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 14, "depends_on": ["dd_sufficiency_gate"], "model": "sonnet"},
     # Phase 4: Dialectic
-    {"step_name": "bull_case", "phase": 4, "phase_name": "Dialectic", "step_order": 14, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
-    {"step_name": "bear_case", "phase": 4, "phase_name": "Dialectic", "step_order": 15, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
+    {"step_name": "bull_case", "phase": 4, "phase_name": "Dialectic", "step_order": 15, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
+    {"step_name": "bear_case", "phase": 4, "phase_name": "Dialectic", "step_order": 16, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
     # Phase 5: Synthesis
-    {"step_name": "catalyst_analysis", "phase": 5, "phase_name": "Synthesis", "step_order": 16, "depends_on": ["bull_case", "bear_case"], "model": "sonnet"},
-    {"step_name": "investment_thesis", "phase": 5, "phase_name": "Synthesis", "step_order": 17, "depends_on": ["bull_case", "bear_case"], "model": "opus"},
-    {"step_name": "bull_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 18, "depends_on": ["investment_thesis"], "model": "sonnet"},
-    {"step_name": "bear_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 19, "depends_on": ["investment_thesis"], "model": "sonnet"},
-    {"step_name": "thesis_coherence_gate", "phase": 5, "phase_name": "Synthesis", "step_order": 20, "depends_on": ["bull_synthesis", "bear_synthesis", "catalyst_analysis"], "model": "none", "retry_strategy": "with_parent"},
-    {"step_name": "investment_memo", "phase": 5, "phase_name": "Synthesis", "step_order": 21, "depends_on": ["thesis_coherence_gate"], "model": "opus"},
-    {"step_name": "research_certification", "phase": 5, "phase_name": "Synthesis", "step_order": 22, "depends_on": ["thesis_coherence_gate"], "model": "sonnet"},
-    {"step_name": "complete", "phase": 5, "phase_name": "Synthesis", "step_order": 23, "depends_on": ["investment_memo", "research_certification"], "model": "none"},
+    {"step_name": "catalyst_analysis", "phase": 5, "phase_name": "Synthesis", "step_order": 17, "depends_on": ["bull_case", "bear_case"], "model": "sonnet"},
+    {"step_name": "investment_thesis", "phase": 5, "phase_name": "Synthesis", "step_order": 18, "depends_on": ["bull_case", "bear_case"], "model": "opus"},
+    {"step_name": "bull_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 19, "depends_on": ["investment_thesis"], "model": "sonnet"},
+    {"step_name": "bear_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 20, "depends_on": ["investment_thesis"], "model": "sonnet"},
+    {"step_name": "thesis_coherence_gate", "phase": 5, "phase_name": "Synthesis", "step_order": 21, "depends_on": ["bull_synthesis", "bear_synthesis", "catalyst_analysis"], "model": "none", "retry_strategy": "with_parent"},
+    {"step_name": "investment_memo", "phase": 5, "phase_name": "Synthesis", "step_order": 22, "depends_on": ["thesis_coherence_gate"], "model": "sonnet"},
+    {"step_name": "research_certification", "phase": 5, "phase_name": "Synthesis", "step_order": 23, "depends_on": ["thesis_coherence_gate"], "model": "sonnet"},
+    {"step_name": "complete", "phase": 5, "phase_name": "Synthesis", "step_order": 24, "depends_on": ["investment_memo", "research_certification"], "model": "none"},
 ]
 
 HFRT_TEMPLATES = {
@@ -72,13 +75,17 @@ HFRT_TEMPLATES = {
 def get_handoff_candidates(db: Session, screen_id: int) -> dict:
     """Load and return HFRT handoff data from a certified IST screen.
 
+    Supports both new (all-tier) and old (Tier-1-only) handoff formats.
+    If the stored handoff is missing ``totalCount`` (old format), falls back
+    to querying ALL candidates directly and builds the full response shape.
+
     Args:
         db: SQLAlchemy session.
         screen_id: ID of the IST screen.
 
     Returns:
         Parsed handoff data dict containing screenName, screenId, certifiedAt,
-        tier1Count, and candidates list.
+        tier1Count, totalCount, tierBreakdown, and candidates list.
 
     Raises:
         ValueError: If screen not found, not certified, or no handoff data.
@@ -101,6 +108,49 @@ def get_handoff_candidates(db: Session, screen_id: int) -> dict:
 
     if not handoff_data:
         raise ValueError("No handoff data available")
+
+    # Backward-compat: old Tier-1-only format lacks totalCount
+    if "totalCount" not in handoff_data:
+        logger.info(
+            "Screen %d has old Tier-1-only handoff format; rebuilding with all tiers",
+            screen_id,
+        )
+        all_rows = (
+            db.query(ISTEquityCandidate, ISTBottleneck.name.label("bn_name"))
+            .outerjoin(ISTBottleneck, ISTEquityCandidate.bottleneck_id == ISTBottleneck.id)
+            .filter(ISTEquityCandidate.screen_id == screen_id)
+            .order_by(ISTEquityCandidate.tier, ISTEquityCandidate.id)
+            .all()
+        )
+        candidates = []
+        tier_counts = {1: 0, 2: 0, 3: 0}
+        for cand, bn_name in all_rows:
+            scarcity_val = None
+            if cand.scarcity_score:
+                try:
+                    parsed = json.loads(cand.scarcity_score)
+                    scarcity_val = parsed.get("overall") if isinstance(parsed, dict) else parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if cand.tier in tier_counts:
+                tier_counts[cand.tier] += 1
+            candidates.append({
+                "ticker": cand.ticker,
+                "companyName": cand.company_name,
+                "tier": cand.tier,
+                "conviction": cand.conviction,
+                "pillar": bn_name or "Unknown",
+                "catalyst": cand.catalyst,
+                "scarcityScore": scarcity_val,
+            })
+        handoff_data["candidates"] = candidates
+        handoff_data["totalCount"] = len(candidates)
+        handoff_data["tierBreakdown"] = {
+            "tier1": tier_counts[1],
+            "tier2": tier_counts[2],
+            "tier3": tier_counts[3],
+        }
+        handoff_data["tier1Count"] = tier_counts[1]
 
     return handoff_data
 

@@ -17,7 +17,9 @@ Analyze the industry for the given company with deep sector expertise:
 11. **Macro sensitivity**: GDP correlation, unemployment sensitivity, housing market exposure
 12. **Capital allocation**: Dividend payout ratio, share buyback capacity, organic growth reinvestment
 
-NEVER fabricate data. Cite sources where possible. Return ONLY valid JSON matching the schema."""
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate NIM figures, capital ratios, AUM data, or regulatory details not present in the provided context.
+Return ONLY valid JSON matching the schema."""
 
 KPIS = [
     "Net Interest Margin (NIM)",

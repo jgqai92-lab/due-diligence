@@ -10,6 +10,7 @@ from app.services.claude_client import (  # noqa: F401
     call_claude_raw,
     clear_workflow_context,
     get_client,
+    get_step_model_tier,
     get_workflow_token_usage,
     set_workflow_context,
 )

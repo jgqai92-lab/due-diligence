@@ -20,19 +20,19 @@ from app.models.ist_synthesis import (
     ISTSynthesisEquity,
     ISTSynthesisSource,
 )
-from app.services.ist.claude_client import call_claude, call_claude_raw
+from app.services.ist.claude_client import call_claude, call_claude_raw, get_step_model_tier
 from app.services.workflow_engine import emit_sse_event, register_step
 
 logger = logging.getLogger(__name__)
 
 IST_SYNTHESIS_WORKFLOW_STEPS = [
-    {"step_name": "screen_ingestion", "phase": 1, "phase_name": "Screen Ingestion", "step_order": 1, "depends_on": [], "model": "opus"},
-    {"step_name": "overlap_matrix", "phase": 1, "phase_name": "Screen Ingestion", "step_order": 2, "depends_on": ["screen_ingestion"], "model": "opus"},
+    {"step_name": "screen_ingestion", "phase": 1, "phase_name": "Screen Ingestion", "step_order": 1, "depends_on": [], "model": "sonnet"},
+    {"step_name": "overlap_matrix", "phase": 1, "phase_name": "Screen Ingestion", "step_order": 2, "depends_on": ["screen_ingestion"], "model": "sonnet"},
     {"step_name": "thesis_interactions", "phase": 1, "phase_name": "Screen Ingestion", "step_order": 3, "depends_on": ["overlap_matrix"], "model": "opus"},
     {"step_name": "synthesis_readiness_gate", "phase": 1, "phase_name": "Screen Ingestion", "step_order": 4, "depends_on": ["thesis_interactions"], "model": "none"},
     {"step_name": "combined_bottleneck_analysis", "phase": 2, "phase_name": "Re-Analysis", "step_order": 5, "depends_on": ["synthesis_readiness_gate"], "model": "opus"},
     {"step_name": "cross_screen_effects", "phase": 2, "phase_name": "Re-Analysis", "step_order": 6, "depends_on": ["combined_bottleneck_analysis"], "model": "opus"},
-    {"step_name": "re_tiering", "phase": 2, "phase_name": "Re-Analysis", "step_order": 7, "depends_on": ["cross_screen_effects"], "model": "opus"},
+    {"step_name": "re_tiering", "phase": 2, "phase_name": "Re-Analysis", "step_order": 7, "depends_on": ["cross_screen_effects"], "model": "sonnet"},
     {"step_name": "synthesis_dialectic_optimist", "phase": 3, "phase_name": "Synthesis", "step_order": 8, "depends_on": ["re_tiering"], "model": "opus"},
     {"step_name": "synthesis_dialectic_pessimist", "phase": 3, "phase_name": "Synthesis", "step_order": 9, "depends_on": ["re_tiering"], "model": "opus"},
     {"step_name": "synthesis_final", "phase": 3, "phase_name": "Synthesis", "step_order": 10, "depends_on": ["synthesis_dialectic_optimist", "synthesis_dialectic_pessimist"], "model": "opus"},
@@ -374,10 +374,12 @@ async def handle_thesis_interactions(workflow_run_id: int) -> dict | None:
                     f"Return JSON matching: {ThesisInteractionResult.model_json_schema()}"
                 )
 
+                model = await get_step_model_tier(workflow_run_id, "thesis_interactions")
                 result = await call_claude(
                     system_prompt=THESIS_INTERACTIONS_SYSTEM_PROMPT,
                     user_prompt=user_prompt,
                     response_model=ThesisInteractionResult,
+                    model=model,
                 )
                 classification = _normalize_classification(result.classification)
 
@@ -519,10 +521,12 @@ async def handle_combined_bottleneck_analysis(workflow_run_id: int) -> dict | No
             f"Identify emergent bottlenecks and temporal dependencies.\n"
             f"Return JSON matching: {CombinedBottleneckResult.model_json_schema()}"
         )
+        model = await get_step_model_tier(workflow_run_id, "combined_bottleneck_analysis")
         result = await call_claude(
             system_prompt=COMBINED_BOTTLENECK_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=CombinedBottleneckResult,
+            model=model,
         )
 
         combined = {
@@ -567,10 +571,12 @@ async def handle_cross_screen_effects(workflow_run_id: int) -> dict | None:
             f"Identify cross-screen effects chains and feedback loops.\n"
             f"Return JSON matching: {CrossScreenEffectsResult.model_json_schema()}"
         )
+        model = await get_step_model_tier(workflow_run_id, "cross_screen_effects")
         result = await call_claude(
             system_prompt=CROSS_SCREEN_EFFECTS_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=CrossScreenEffectsResult,
+            model=model,
         )
 
         combined["crossScreenEffects"] = {
@@ -655,10 +661,12 @@ async def handle_re_tiering(workflow_run_id: int) -> dict | None:
                 f"Reassess tiers for each ticker and return JSON matching: "
                 f"{TierReassessmentBatch.model_json_schema()}"
             )
+            model = await get_step_model_tier(workflow_run_id, "re_tiering")
             reassessment = await call_claude(
                 system_prompt=RE_TIERING_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 response_model=TierReassessmentBatch,
+                model=model,
             )
             for item in reassessment.assessments:
                 ticker = _safe_text(item.ticker, "").upper()
@@ -758,10 +766,12 @@ async def handle_synthesis_dialectic_optimist(workflow_run_id: int) -> dict | No
             f"Build the strongest credible optimist case for synthesis '{synthesis.name}'.\n"
             f"Return JSON matching: {_DialecticPayload.model_json_schema()}"
         )
+        model = await get_step_model_tier(workflow_run_id, "synthesis_dialectic_optimist")
         payload = await call_claude(
             system_prompt=SYNTHESIS_OPTIMIST_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=_DialecticPayload,
+            model=model,
         )
 
         db.add(
@@ -802,10 +812,12 @@ async def handle_synthesis_dialectic_pessimist(workflow_run_id: int) -> dict | N
             f"Build the strongest credible pessimist case for synthesis '{synthesis.name}'.\n"
             f"Return JSON matching: {_DialecticPayload.model_json_schema()}"
         )
+        model = await get_step_model_tier(workflow_run_id, "synthesis_dialectic_pessimist")
         payload = await call_claude(
             system_prompt=SYNTHESIS_PESSIMIST_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=_DialecticPayload,
+            model=model,
         )
 
         db.add(
@@ -884,9 +896,11 @@ async def handle_synthesis_final(workflow_run_id: int) -> dict | None:
             f"<synthesis_data>\n{json.dumps(synthesis_data, indent=2)}\n</synthesis_data>\n\n"
             "Write a complete markdown report for this synthesis."
         )
+        model = await get_step_model_tier(workflow_run_id, "synthesis_final")
         report = await call_claude_raw(
             system_prompt=SYNTHESIS_FINAL_REPORT_SYSTEM_PROMPT,
             user_prompt=report_prompt,
+            model=model,
         )
 
         synthesis.combined_report = report
@@ -916,6 +930,7 @@ async def handle_synthesis_final(workflow_run_id: int) -> dict | None:
             system_prompt=SYNTHESIS_RECONCILIATION_SYSTEM_PROMPT,
             user_prompt=synthesis_prompt,
             response_model=_DialecticPayload,
+            model=model,
         )
         db.add(
             ISTSynthesisDialectic(

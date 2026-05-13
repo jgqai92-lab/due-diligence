@@ -33,7 +33,7 @@ interface TocEntry {
  * code blocks, horizontal rules, and paragraphs with inline formatting.
  */
 type MdBlock =
-  | { type: "heading"; level: 1 | 2 | 3; text: string; id: string }
+  | { type: "heading"; level: 1 | 2 | 3 | 4; text: string; id: string }
   | { type: "blockquote"; lines: string[] }
   | { type: "table"; headers: string[]; rows: string[][] }
   | { type: "ul"; items: string[] }
@@ -81,10 +81,10 @@ function parseMarkdown(raw: string): { blocks: MdBlock[]; toc: TocEntry[] } {
       continue;
     }
 
-    // Headings
-    const headingMatch = line.match(/^(#{1,3})\s+(.+)/);
+    // Headings (h1-h6 in markdown; clamp to h4 for rendering)
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
     if (headingMatch) {
-      const level = headingMatch[1].length as 1 | 2 | 3;
+      const level = Math.min(headingMatch[1].length, 4) as 1 | 2 | 3 | 4;
       const text = headingMatch[2].trim();
       const id = slugify(text);
       blocks.push({ type: "heading", level, text, id });
@@ -284,13 +284,15 @@ function renderInline(text: string): React.ReactNode[] {
 // ─── Block Renderers ────────────────────────────────────────────
 
 function HeadingBlock({ block }: { block: Extract<MdBlock, { type: "heading" }> }) {
-  const Tag = `h${block.level}` as "h1" | "h2" | "h3";
+  const Tag = (block.level <= 3 ? `h${block.level}` : "h4") as "h1" | "h2" | "h3" | "h4";
   const sizeClass =
     block.level === 1
       ? "text-2xl font-bold text-text-primary mt-10 mb-4 font-display"
       : block.level === 2
       ? "text-xl font-bold text-text-primary mt-8 mb-3 font-display"
-      : "text-base font-semibold text-text-primary mt-6 mb-2";
+      : block.level === 3
+      ? "text-base font-semibold text-text-primary mt-6 mb-2"
+      : "text-sm font-semibold text-text-primary mt-4 mb-1.5";
 
   return (
     <Tag id={block.id} className={cn(sizeClass, "scroll-mt-24")}>
@@ -441,6 +443,7 @@ function TocSidebar({
                 entry.level === 1 && "font-medium",
                 entry.level === 2 && "pl-3",
                 entry.level === 3 && "pl-6",
+                entry.level === 4 && "pl-9",
                 activeId === entry.id
                   ? "text-primary font-medium"
                   : "text-text-secondary hover:text-text-primary"

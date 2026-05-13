@@ -23,6 +23,7 @@ import type {
   HandoffResponse,
   FrameworkListResponse,
   FrameworkDetail,
+  WatchlistResponse,
 } from '@/types/ist';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -371,6 +372,32 @@ export async function getCertification(screenId: number): Promise<CertificationR
 
 export async function getHandoff(screenId: number): Promise<HandoffResponse> {
   const res = await fetch(`${API_BASE}/api/ist/screens/${screenId}/handoff`, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) await handleErrorResponse(res);
+  return res.json();
+}
+
+// ─── Get Watchlist (Cross-Screen) ────────────────────────────────
+
+export async function getWatchlist(params?: {
+  tier?: string;
+  conviction?: string;
+  sortBy?: string;
+  sortDir?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<WatchlistResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.tier) searchParams.set('tier', params.tier);
+  if (params?.conviction) searchParams.set('conviction', params.conviction);
+  if (params?.sortBy) searchParams.set('sort_by', params.sortBy);
+  if (params?.sortDir) searchParams.set('sort_dir', params.sortDir);
+  if (params?.limit) searchParams.set('limit', String(params.limit));
+  if (params?.offset) searchParams.set('offset', String(params.offset));
+
+  const url = `${API_BASE}/api/ist/watchlist?${searchParams}`;
+  const res = await fetch(url, {
     headers: { 'Content-Type': 'application/json' },
   });
   if (!res.ok) await handleErrorResponse(res);

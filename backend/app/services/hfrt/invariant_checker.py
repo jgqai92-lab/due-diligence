@@ -4,9 +4,9 @@ Invariants:
   INV-01: Multi-source citations — every factual claim has >=1 source citation
   INV-02: No forward estimates — no analyst-originated forward estimates
   INV-03: DCF terminal linkage — DCF terminal assumptions linked to competitive position
-  INV-04: Risk register populated — >=5 risk entries with probability and impact
-  INV-05: Management red flags checked — all red flag categories addressed
-  INV-06: Earnings quality scored — QoE has a numeric score with methodology
+  INV-04: Risk register populated — >=5 risk entries with probability and impact (size-aware)
+  INV-05: Management red flags checked — all red flag categories addressed (size-aware)
+  INV-06: Earnings quality scored — QoE has a numeric score with methodology or cash_flow_quality_score
   INV-07: Dialectic isolation — bull and bear contain no cross-references
   INV-08: Thesis conviction scored — investment thesis has conviction with factor breakdown
 """
@@ -20,6 +20,48 @@ from app.database import SessionLocal
 from app.models.hfrt import HFRTDialecticReview, HFRTProject, HFRTTemplate
 
 logger = logging.getLogger(__name__)
+
+
+# ── Market cap tier thresholds (Gap 3) ───────────────────────────────────────
+
+MARKET_CAP_TIER_THRESHOLDS = {
+    "mega_cap": {
+        "min_market_cap_billions": 100.0,
+        "min_risk_entries": 8,       # INV-04: larger companies = more risk surface
+        "min_mgmt_categories": 4,   # INV-05: all categories expected for mega-caps
+    },
+    "mid_cap": {
+        "min_market_cap_billions": 2.0,
+        "min_risk_entries": 5,
+        "min_mgmt_categories": 3,
+    },
+    "small_cap": {
+        "min_market_cap_billions": 0.0,
+        "min_risk_entries": 3,       # Smaller companies may have fewer risk vectors
+        "min_mgmt_categories": 2,   # Smaller mgmt teams may have fewer categories
+    },
+}
+
+
+def _get_market_cap_tier(db, project_id: int) -> str:
+    """Return market cap tier ('mega_cap', 'mid_cap', 'small_cap') for a project.
+
+    Loads market_cap from HFRTProject (set during idea_screen from yfinance data).
+    Defaults to 'mid_cap' if unknown.
+    """
+    project = db.query(HFRTProject).filter(HFRTProject.id == project_id).first()
+    if not project or project.market_cap is None:
+        logger.debug("market_cap unknown for project %d — defaulting to mid_cap", project_id)
+        return "mid_cap"
+
+    market_cap_b = project.market_cap  # stored in billions by idea_screener
+
+    if market_cap_b >= MARKET_CAP_TIER_THRESHOLDS["mega_cap"]["min_market_cap_billions"]:
+        return "mega_cap"
+    elif market_cap_b >= MARKET_CAP_TIER_THRESHOLDS["mid_cap"]["min_market_cap_billions"]:
+        return "mid_cap"
+    else:
+        return "small_cap"
 
 
 def _get_template_data(db, project_id: int, template_number: int) -> dict | None:
@@ -74,6 +116,10 @@ def _check_invariants(db, project_id: int) -> list[dict[str, Any]]:
     competitive = _get_template_data(db, project_id, 3)
     idea_screen = _get_template_data(db, project_id, 0)
 
+    # Determine market cap tier for size-aware thresholds (Gap 3)
+    tier = _get_market_cap_tier(db, project_id)
+    tier_thresholds = MARKET_CAP_TIER_THRESHOLDS[tier]
+
     # INV-01: Multi-source citations
     # Check that the idea screen, management, and risk templates have source citations
     has_citations = True
@@ -127,16 +173,17 @@ def _check_invariants(db, project_id: int) -> list[dict[str, Any]]:
         f"Competitive position: {'present' if has_competitive else 'missing'}",
     )
 
-    # INV-04: Risk register populated (>=5 entries)
+    # INV-04: Risk register populated (size-aware minimum; Gap 3)
     risk_entries = risk.get("risk_register", []) if risk else []
     risk_count = len(risk_entries)
+    min_risk = tier_thresholds["min_risk_entries"]
     check(
         "INV-04", "Risk register populated",
-        risk_count >= 5,
-        f"Risk register has {risk_count} entries (>= 5 required)",
+        risk_count >= min_risk,
+        f"Risk register has {risk_count} entries (>= {min_risk} required for {tier})",
     )
 
-    # INV-05: Management red flags checked
+    # INV-05: Management red flags checked (size-aware minimum; Gap 3)
     has_mgmt = bool(management)
     red_flag_categories = ["insider_selling", "compensation", "board_composition", "ceo"]
     covered = 0
@@ -144,23 +191,32 @@ def _check_invariants(db, project_id: int) -> list[dict[str, Any]]:
         for cat in red_flag_categories:
             if management.get(cat) is not None:
                 covered += 1
+    min_mgmt = tier_thresholds["min_mgmt_categories"]
     check(
         "INV-05", "Management red flags checked",
-        has_mgmt and covered >= 3,
-        f"Management assessment covers {covered}/{len(red_flag_categories)} red flag categories",
+        has_mgmt and covered >= min_mgmt,
+        f"Management assessment covers {covered}/{len(red_flag_categories)} red flag categories "
+        f"(>= {min_mgmt} required for {tier})",
     )
 
-    # INV-06: Earnings quality scored
+    # INV-06: Earnings quality scored (Gap 3: also checks cash_flow_quality_score)
     has_qoe = bool(earnings)
     has_score = bool(earnings and (
         earnings.get("quality_score") is not None
         or earnings.get("overall_score") is not None
         or earnings.get("score") is not None
+        or earnings.get("cash_flow_quality_score") is not None  # Gap 3 addition
     ))
+    score_field = None
+    if earnings:
+        for field in ("quality_score", "overall_score", "score", "cash_flow_quality_score"):
+            if earnings.get(field) is not None:
+                score_field = field
+                break
     check(
         "INV-06", "Earnings quality scored",
         has_qoe and has_score,
-        "QoE analysis with numeric score" if has_score else (
+        f"QoE analysis with numeric score ({score_field})" if has_score else (
             "QoE present but no score" if has_qoe else "No QoE analysis"
         ),
     )

@@ -22,7 +22,8 @@ from pydantic import BaseModel, Field
 
 from app.database import SessionLocal
 from app.models.hfrt import HFRTProject, HFRTTemplate
-from app.services.claude_client import call_claude
+from app.services.claude_client import call_claude, get_step_model_tier
+from app.services.perplexity_client import is_available as perplexity_available, search_and_analyze
 from app.services.workflow_engine import register_step, emit_sse_event
 
 logger = logging.getLogger(__name__)
@@ -177,8 +178,35 @@ async def handle_idea_screen(workflow_run_id: int) -> dict | None:
             },
         )
 
+        # Optionally enrich with current news/price from Perplexity
+        current_data_block = ""
+        if perplexity_available():
+            try:
+                pplx = await search_and_analyze(
+                    system_prompt=(
+                        "You are a financial data analyst. Provide the current "
+                        "stock price, recent trading volume, and any significant "
+                        "recent news or events for the given ticker. Focus on "
+                        "facts that affect investability."
+                    ),
+                    user_prompt=(
+                        f"Current price, recent volume, and significant recent news "
+                        f"for {project.ticker}"
+                    ),
+                    model="sonar",
+                    max_tokens=2048,
+                    workflow_run_id=workflow_run_id,
+                )
+                current_data_block = (
+                    f"<current_market_data>\n{pplx.content}\n</current_market_data>\n\n"
+                )
+                logger.info("Perplexity idea screen enrichment: %d citations", len(pplx.citations))
+            except Exception:
+                logger.warning("Perplexity idea screen enrichment failed, continuing without", exc_info=True)
+
         # Build Claude prompt (INV-AI-01: data in XML tags)
         user_prompt = (
+            f"{current_data_block}"
             f"<company_data>\n{json.dumps(yf_data, indent=2, default=str)}\n</company_data>\n\n"
             f"Perform an idea screen on {project.ticker}. "
             f"Assess investability, liquidity, and identify any red flags.\n"
@@ -186,10 +214,12 @@ async def handle_idea_screen(workflow_run_id: int) -> dict | None:
         )
 
         # Call Claude (INV-AI-03: Pydantic-validated)
+        model = await get_step_model_tier(workflow_run_id, "idea_screen")
         result = await call_claude(
             system_prompt=IDEA_SCREEN_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             response_model=IdeaScreenOutput,
+            model=model,
         )
 
         await emit_sse_event(

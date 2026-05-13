@@ -87,7 +87,7 @@ function FrameworkTestCard({
   return (
     <div className="bg-[rgba(10,15,26,0.6)] backdrop-blur-[12px] border border-border rounded-xl p-5 hover:bg-white/5 transition-colors duration-200">
       <div className="mb-3">
-        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-violet-500/10 text-violet-400 mb-2">
+        <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-medium bg-violet-500/10 text-violet-400 mb-2">
           {test.framework}
         </span>
         <p className="text-sm font-medium text-text-primary leading-relaxed">

@@ -368,25 +368,15 @@ async def retry_workflow_endpoint(
             ),
         )
 
-    if run.status != "FAILED":
+    if run.status not in ("FAILED", "RUNNING"):
         raise HTTPException(
             status_code=409,
             detail=_error(
                 "INVALID_STATE",
                 f"Cannot retry workflow in {run.status} state. "
-                "Only FAILED workflows can be retried.",
+                "Only FAILED or orphaned RUNNING workflows can be retried.",
             ),
         )
-
-    # Find which step failed for the response message
-    failed_step = (
-        db.query(WorkflowStep)
-        .filter(WorkflowStep.workflow_run_id == workflow_id)
-        .filter(WorkflowStep.status == "FAILED")
-        .order_by(WorkflowStep.step_order)
-        .first()
-    )
-    retry_from = failed_step.step_name if failed_step else "unknown"
 
     try:
         await retry_workflow(workflow_id)
@@ -395,6 +385,16 @@ async def retry_workflow_endpoint(
             status_code=409,
             detail=_error("RETRY_FAILED", str(e)[:500]),
         )
+
+    # Find which step will be retried (first non-completed step after recovery)
+    retry_step = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.workflow_run_id == workflow_id)
+        .filter(WorkflowStep.status != "COMPLETED")
+        .order_by(WorkflowStep.step_order)
+        .first()
+    )
+    retry_from = retry_step.step_name if retry_step else "unknown"
 
     return {
         "id": workflow_id,

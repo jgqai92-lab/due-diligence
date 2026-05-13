@@ -50,6 +50,7 @@ from app.schemas.ist import (
     ISTScreenResponse,
     ScreeningBrief,
 )
+from app.services.ist.final_synthesis import _run_invariant_checks
 from app.services.ist.refresh import IST_REFRESH_WORKFLOW_STEPS
 
 logger = logging.getLogger(__name__)
@@ -63,15 +64,15 @@ router = APIRouter(prefix="/api/ist", tags=["ist"])
 
 IST_WORKFLOW_STEPS = [
     # Phase 1: Content Extraction
-    {"step_name": "content_extraction", "phase": 1, "phase_name": "Content Extraction", "step_order": 1, "depends_on": [], "model": "opus"},
+    {"step_name": "content_extraction", "phase": 1, "phase_name": "Content Extraction", "step_order": 1, "depends_on": [], "model": "sonnet"},
     {"step_name": "source_bias_assessment", "phase": 1, "phase_name": "Content Extraction", "step_order": 2, "depends_on": ["content_extraction"], "model": "sonnet"},
     # Phase 2: Thematic Analysis
     {"step_name": "bottleneck_mapping", "phase": 2, "phase_name": "Thematic Analysis", "step_order": 3, "depends_on": ["content_extraction"], "model": "opus"},
-    {"step_name": "demand_modeling", "phase": 2, "phase_name": "Thematic Analysis", "step_order": 4, "depends_on": ["bottleneck_mapping"], "model": "opus"},
-    {"step_name": "external_validation", "phase": 2, "phase_name": "Thematic Analysis", "step_order": 5, "depends_on": ["content_extraction"], "model": "opus"},
+    {"step_name": "demand_modeling", "phase": 2, "phase_name": "Thematic Analysis", "step_order": 4, "depends_on": ["bottleneck_mapping"], "model": "sonnet"},
+    {"step_name": "external_validation", "phase": 2, "phase_name": "Thematic Analysis", "step_order": 5, "depends_on": ["content_extraction"], "model": "sonnet"},
     {"step_name": "content_sufficiency_gate", "phase": 2, "phase_name": "Thematic Analysis", "step_order": 6, "depends_on": ["demand_modeling", "external_validation", "source_bias_assessment"], "model": "none", "retry_strategy": "with_parent"},
     # Phase 3: Equity Identification
-    {"step_name": "equity_scanning", "phase": 3, "phase_name": "Equity Identification", "step_order": 7, "depends_on": ["content_sufficiency_gate"], "model": "opus"},
+    {"step_name": "equity_scanning", "phase": 3, "phase_name": "Equity Identification", "step_order": 7, "depends_on": ["content_sufficiency_gate"], "model": "sonnet"},
     {"step_name": "tier_classification", "phase": 3, "phase_name": "Equity Identification", "step_order": 8, "depends_on": ["equity_scanning"], "model": "sonnet"},
     {"step_name": "effects_analysis", "phase": 3, "phase_name": "Equity Identification", "step_order": 9, "depends_on": ["equity_scanning"], "model": "opus"},
     {"step_name": "invariant_check", "phase": 3, "phase_name": "Equity Identification", "step_order": 10, "depends_on": ["tier_classification", "effects_analysis"], "model": "none"},
@@ -81,11 +82,11 @@ IST_WORKFLOW_STEPS = [
     {"step_name": "dialectic_pessimist", "phase": 4, "phase_name": "Dialectic Scrutiny", "step_order": 13, "depends_on": ["research_sufficiency_gate"], "model": "opus"},
     {"step_name": "dialectic_synthesis", "phase": 4, "phase_name": "Dialectic Scrutiny", "step_order": 14, "depends_on": ["dialectic_optimist", "dialectic_pessimist"], "model": "opus"},
     # Phase 5: Final Synthesis (INV-WF-01: ordering is immutable)
-    {"step_name": "master_screen", "phase": 5, "phase_name": "Final Synthesis", "step_order": 15, "depends_on": ["dialectic_synthesis"], "model": "opus"},
+    {"step_name": "master_screen", "phase": 5, "phase_name": "Final Synthesis", "step_order": 15, "depends_on": ["dialectic_synthesis"], "model": "sonnet"},
     {"step_name": "rotation_strategy", "phase": 5, "phase_name": "Final Synthesis", "step_order": 16, "depends_on": ["master_screen"], "model": "sonnet"},
     {"step_name": "catalyst_calendar", "phase": 5, "phase_name": "Final Synthesis", "step_order": 17, "depends_on": ["master_screen"], "model": "sonnet"},
     {"step_name": "stress_tests", "phase": 5, "phase_name": "Final Synthesis", "step_order": 18, "depends_on": ["master_screen"], "model": "sonnet"},
-    {"step_name": "report_generation", "phase": 5, "phase_name": "Final Synthesis", "step_order": 19, "depends_on": ["rotation_strategy", "catalyst_calendar", "stress_tests"], "model": "opus"},
+    {"step_name": "report_generation", "phase": 5, "phase_name": "Final Synthesis", "step_order": 19, "depends_on": ["rotation_strategy", "catalyst_calendar", "stress_tests"], "model": "sonnet"},
     {"step_name": "screen_coherence_gate", "phase": 5, "phase_name": "Final Synthesis", "step_order": 20, "depends_on": ["report_generation"], "model": "none", "retry_strategy": "with_parent"},
     {"step_name": "screen_certification", "phase": 5, "phase_name": "Final Synthesis", "step_order": 21, "depends_on": ["screen_coherence_gate"], "model": "sonnet"},
     {"step_name": "hfrt_handoff_generation", "phase": 5, "phase_name": "Final Synthesis", "step_order": 22, "depends_on": ["screen_certification"], "model": "sonnet"},
@@ -1207,6 +1208,8 @@ def get_screen_demand_models(screen_id: int, db: Session = Depends(get_db)):
             "bearCase": bear_case,
             "sensitivityTable": sensitivity_table,
             "multiplierChain": dm.multiplier_chain,
+            "methodology": dm.methodology,
+            "sources": _safe_json_parse(dm.sources) if dm.sources else [],
             "createdAt": dm.created_at.isoformat() if dm.created_at else None,
         })
 
@@ -1274,6 +1277,7 @@ def get_screen_validation(screen_id: int, db: Session = Depends(get_db)):
             "evidence": val.evidence,
             "sources": sources,
             "searchQueries": search_queries,
+            "reasoning": val.reasoning,
             "validatedAt": val.validated_at.isoformat() if val.validated_at else None,
         })
 
@@ -1501,98 +1505,8 @@ def get_screen_invariants(screen_id: int, db: Session = Depends(get_db)):
             detail=_error("SCREEN_NOT_FOUND", f"No screen with id {screen_id}"),
         )
 
-    # Run all invariant checks inline (same logic as the step handler)
-    invariants = []
-
-    # INV-1: Source Citation Required
-    claims = (
-        db.query(ISTClaim)
-        .filter(ISTClaim.screen_id == screen_id)
-        .all()
-    )
-    total_claims = len(claims)
-    claims_with_citation = sum(
-        1 for c in claims
-        if c.source_citation is not None and c.source_citation.strip() != ""
-    )
-    inv1_pass = total_claims > 0 and claims_with_citation == total_claims
-    invariants.append({
-        "id": "INV-1",
-        "name": "Source Citation Required",
-        "status": "PASS" if inv1_pass else "FAIL",
-        "details": (
-            f"All {total_claims} claims have source citations."
-            if inv1_pass
-            else f"{claims_with_citation}/{total_claims} claims have source citations."
-        ),
-    })
-
-    # INV-2: Quantitative Anchor Required (>= 50%)
-    claims_with_quant = sum(
-        1 for c in claims
-        if c.quantitative_anchor is not None and c.quantitative_anchor.strip() != ""
-    )
-    quant_pct = (claims_with_quant / total_claims * 100) if total_claims > 0 else 0
-    inv2_pass = total_claims > 0 and quant_pct >= 50
-    invariants.append({
-        "id": "INV-2",
-        "name": "Quantitative Anchor Required",
-        "status": "PASS" if inv2_pass else "FAIL",
-        "details": (
-            f"{claims_with_quant}/{total_claims} claims ({quant_pct:.0f}%) have "
-            f"quantitative anchors (>= 50% required)."
-        ),
-    })
-
-    # INV-3: Temporal Marker Required
-    claims_with_temporal = sum(
-        1 for c in claims
-        if c.temporal_marker is not None and c.temporal_marker.strip() != ""
-    )
-    inv3_pass = claims_with_temporal >= 1
-    invariants.append({
-        "id": "INV-3",
-        "name": "Temporal Marker Required",
-        "status": "PASS" if inv3_pass else "FAIL",
-        "details": f"{claims_with_temporal} claims have temporal markers (>= 1 required).",
-    })
-
-    # INV-4: No Orphan Equities
-    candidates = (
-        db.query(ISTEquityCandidate)
-        .filter(ISTEquityCandidate.screen_id == screen_id)
-        .all()
-    )
-    total_candidates = len(candidates)
-    orphan_candidates = sum(1 for c in candidates if c.bottleneck_id is None)
-    inv4_pass = total_candidates == 0 or orphan_candidates == 0
-    invariants.append({
-        "id": "INV-4",
-        "name": "No Orphan Equities",
-        "status": "PASS" if inv4_pass else "FAIL",
-        "details": (
-            f"All {total_candidates} candidates linked to bottlenecks."
-            if inv4_pass
-            else f"{orphan_candidates}/{total_candidates} candidates lack bottleneck linkage."
-        ),
-    })
-
-    # INV-5: Tier Justification Required
-    candidates_with_rationale = sum(
-        1 for c in candidates
-        if c.tier_rationale is not None and c.tier_rationale.strip() != ""
-    )
-    inv5_pass = total_candidates == 0 or candidates_with_rationale == total_candidates
-    invariants.append({
-        "id": "INV-5",
-        "name": "Tier Justification Required",
-        "status": "PASS" if inv5_pass else "FAIL",
-        "details": (
-            f"All {total_candidates} candidates have tier rationale."
-            if inv5_pass
-            else f"{candidates_with_rationale}/{total_candidates} candidates have tier rationale."
-        ),
-    })
+    # Run invariant checks 1-5 via shared helper (content-type-aware)
+    invariants = _run_invariant_checks(db, screen_id, content_type=screen.content_type)
 
     # INV-6, 7, 8: Skipped (checked in later phases)
     invariants.append({
@@ -1624,6 +1538,120 @@ def get_screen_invariants(screen_id: int, db: Session = Depends(get_db)):
         "allPassed": all_passed,
         "passCount": pass_count,
         "failCount": fail_count,
+    }
+
+
+# ── GET /api/ist/watchlist — Cross-Screen Equity Watchlist ────────────────────
+
+
+@router.get("/watchlist")
+def get_watchlist(
+    tier: Optional[str] = Query(default=None, description="Comma-separated: 1,2,3"),
+    conviction: Optional[str] = Query(default=None, description="HIGH,MEDIUM,LOW"),
+    sort_by: str = Query(default="tier", description="tier|ticker|conviction|scarcity|screen"),
+    sort_dir: str = Query(default="asc"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """Aggregate equity candidates across all IST screens.
+
+    Returns candidates with optional tier/conviction filters, sortable columns,
+    pagination, multi-screen detection, and tier breakdown.
+    """
+    # --- Base query: candidates + screen + bottleneck ---
+    base_q = (
+        db.query(
+            ISTEquityCandidate,
+            ISTScreen.name.label("screen_name"),
+            ISTScreen.created_at.label("screen_date"),
+            ISTBottleneck.name.label("bottleneck_name"),
+        )
+        .join(ISTScreen, ISTEquityCandidate.screen_id == ISTScreen.id)
+        .outerjoin(ISTBottleneck, ISTEquityCandidate.bottleneck_id == ISTBottleneck.id)
+    )
+
+    # --- Optional filters ---
+    if tier:
+        tier_values = [int(t.strip()) for t in tier.split(",") if t.strip().isdigit()]
+        if tier_values:
+            base_q = base_q.filter(ISTEquityCandidate.tier.in_(tier_values))
+
+    if conviction:
+        conv_values = [c.strip().upper() for c in conviction.split(",") if c.strip()]
+        if conv_values:
+            base_q = base_q.filter(ISTEquityCandidate.conviction.in_(conv_values))
+
+    # --- Sort ---
+    sort_map = {
+        "tier": ISTEquityCandidate.tier,
+        "ticker": ISTEquityCandidate.ticker,
+        "conviction": ISTEquityCandidate.conviction,
+        "scarcity": ISTEquityCandidate.scarcity_score,
+        "screen": ISTScreen.name,
+    }
+    sort_col = sort_map.get(sort_by, ISTEquityCandidate.tier)
+    if sort_dir.lower() == "desc":
+        sort_col = sort_col.desc()
+    base_q = base_q.order_by(sort_col, ISTEquityCandidate.id)
+
+    # --- Total count (before pagination) ---
+    total = base_q.count()
+
+    # --- Paginate ---
+    rows = base_q.offset(offset).limit(limit).all()
+
+    # --- Multi-screen detection (unfiltered) ---
+    multi_screen_rows = (
+        db.query(
+            ISTEquityCandidate.ticker,
+            func.count(func.distinct(ISTEquityCandidate.screen_id)).label("screen_count"),
+        )
+        .group_by(ISTEquityCandidate.ticker)
+        .having(func.count(func.distinct(ISTEquityCandidate.screen_id)) > 1)
+        .all()
+    )
+    multi_screen_map = {r.ticker: r.screen_count for r in multi_screen_rows}
+    multi_screen_tickers = [
+        {"ticker": r.ticker, "screenCount": r.screen_count} for r in multi_screen_rows
+    ]
+
+    # --- Tier breakdown (unfiltered) ---
+    tier_counts = (
+        db.query(ISTEquityCandidate.tier, func.count(ISTEquityCandidate.id))
+        .group_by(ISTEquityCandidate.tier)
+        .all()
+    )
+    tier_breakdown = {"tier1": 0, "tier2": 0, "tier3": 0}
+    for t, cnt in tier_counts:
+        key = f"tier{t}"
+        if key in tier_breakdown:
+            tier_breakdown[key] = cnt
+
+    # --- Build response ---
+    candidates = []
+    for cand, screen_name, screen_date, bn_name in rows:
+        scarcity = _deep_camel(_safe_json_parse(cand.scarcity_score))
+        candidates.append({
+            "id": cand.id,
+            "ticker": cand.ticker,
+            "companyName": cand.company_name,
+            "tier": cand.tier,
+            "conviction": cand.conviction,
+            "scarcityScore": scarcity,
+            "catalyst": cand.catalyst,
+            "bottleneckName": bn_name or "Unknown",
+            "screenId": cand.screen_id,
+            "screenName": screen_name,
+            "screenDate": screen_date.isoformat() if screen_date else None,
+            "appearsInScreens": multi_screen_map.get(cand.ticker, 1),
+        })
+
+    return {
+        "candidates": candidates,
+        "total": total,
+        "tierBreakdown": tier_breakdown,
+        "multiScreenTickers": multi_screen_tickers,
     }
 
 
@@ -2313,7 +2341,7 @@ def get_report(screen_id: int, db: Session = Depends(get_db)):
 def get_handoff(screen_id: int, db: Session = Depends(get_db)):
     """Get the HFRT handoff data for a certified screen.
 
-    Returns Tier 1 candidates formatted for HFRT workflow bridge.
+    Returns all candidates (all tiers) formatted for HFRT workflow bridge.
 
     INV-PE-01: Batch query for candidates + bottleneck names.
     """
@@ -2334,23 +2362,23 @@ def get_handoff(screen_id: int, db: Session = Depends(get_db)):
             ),
         )
 
-    # Load Tier 1 candidates with bottleneck names (INV-PE-01)
-    tier1_candidates = (
+    # Load ALL candidates with bottleneck names (INV-PE-01)
+    all_candidates = (
         db.query(
             ISTEquityCandidate,
             ISTBottleneck.name.label("bottleneck_name"),
         )
         .outerjoin(ISTBottleneck, ISTEquityCandidate.bottleneck_id == ISTBottleneck.id)
-        .filter(
-            ISTEquityCandidate.screen_id == screen_id,
-            ISTEquityCandidate.tier == 1,
-        )
-        .order_by(ISTEquityCandidate.id)
+        .filter(ISTEquityCandidate.screen_id == screen_id)
+        .order_by(ISTEquityCandidate.tier, ISTEquityCandidate.id)
         .all()
     )
 
     candidates = []
-    for cand, bn_name in tier1_candidates:
+    tier_counts = {1: 0, 2: 0, 3: 0}
+    for cand, bn_name in all_candidates:
+        if cand.tier in tier_counts:
+            tier_counts[cand.tier] += 1
         candidates.append({
             "ticker": cand.ticker,
             "companyName": cand.company_name,
@@ -2366,7 +2394,9 @@ def get_handoff(screen_id: int, db: Session = Depends(get_db)):
         "screenName": screen.name,
         "certified": True,
         "certifiedAt": screen.certified_at.isoformat() if screen.certified_at else None,
-        "tier1Count": len(candidates),
+        "tier1Count": tier_counts[1],
+        "totalCount": len(candidates),
+        "tierBreakdown": {"tier1": tier_counts[1], "tier2": tier_counts[2], "tier3": tier_counts[3]},
         "candidates": candidates,
     }
 

@@ -52,8 +52,9 @@ def client(db):
         ist as ist_router_mod,
         ist_synthesis as ist_synth_router_mod,
         workflows as wf_router_mod,
+        hfrt as hfrt_router_mod,
     )
-    for mod in [ist_router_mod, wf_router_mod, ist_synth_router_mod]:
+    for mod in [ist_router_mod, wf_router_mod, ist_synth_router_mod, hfrt_router_mod]:
         if hasattr(mod, "limiter"):
             try:
                 mod.limiter.reset()

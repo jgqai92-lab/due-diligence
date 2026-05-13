@@ -15,9 +15,10 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 from typing import TypeVar, Type
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, RateLimitError
 from pydantic import BaseModel
 
 from app.config import settings
@@ -32,7 +33,7 @@ T = TypeVar("T", bound=BaseModel)
 # Unrecognized values fall through to settings.claude_model as a safety default.
 MODEL_IDS: dict[str, str] = {
     "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-5-20250929",
+    "sonnet": "claude-sonnet-4-6",
 }
 
 
@@ -74,7 +75,7 @@ def _get_semaphore() -> asyncio.Semaphore:
     return _api_semaphore
 
 # ── Token budget tracking (D-01, ATLAS-5) ──────────────────────────────────
-TOKEN_BUDGET = 500_000
+TOKEN_BUDGET = 750_000
 
 # Contextvar set by workflow engine before executing steps
 _current_workflow_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
@@ -135,12 +136,136 @@ def _track_token_usage(response) -> None:
         )
 
 
+async def get_step_model_tier(workflow_run_id: int, step_name: str) -> str | None:
+    """Look up the model_tier for a specific workflow step from the DB.
+
+    Returns the model_tier value ("opus", "sonnet", "none", or None).
+    Used by step handlers to pass the correct model to call_claude().
+    """
+    from app.database import SessionLocal
+    from app.models.workflow import WorkflowStep
+
+    db = SessionLocal()
+    try:
+        step = (
+            db.query(WorkflowStep.model_tier)
+            .filter(
+                WorkflowStep.workflow_run_id == workflow_run_id,
+                WorkflowStep.step_name == step_name,
+            )
+            .first()
+        )
+        return step.model_tier if step else None
+    finally:
+        db.close()
+
+
+def _extract_json(text: str) -> str:
+    """Extract and repair JSON from Claude's response text.
+
+    Handles markdown-wrapped JSON, trailing commas, unescaped control chars,
+    and truncated output (missing closing brackets).
+    """
+    # Strip markdown fences
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+    else:
+        text = text.strip()
+
+    # Try parsing as-is first
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        pass
+
+    # Repair: remove trailing commas before } or ]
+    repaired = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # Repair: remove unescaped control characters inside strings
+    repaired = re.sub(r"[\x00-\x1f](?![\n\r\t])", " ", repaired)
+
+    try:
+        json.loads(repaired)
+        return repaired
+    except json.JSONDecodeError:
+        pass
+
+    # Repair: try to close truncated JSON (output hit max_tokens)
+    # Count unmatched braces/brackets
+    opens = repaired.count("{") - repaired.count("}")
+    open_brackets = repaired.count("[") - repaired.count("]")
+
+    if opens > 0 or open_brackets > 0:
+        # Strip trailing partial content after last complete value
+        # Remove trailing comma or partial string
+        repaired = re.sub(r',\s*"[^"]*$', "", repaired)
+        repaired = re.sub(r",\s*$", "", repaired)
+        repaired += "]" * open_brackets + "}" * opens
+
+        try:
+            json.loads(repaired)
+            logger.info("Repaired truncated JSON by closing %d braces, %d brackets", opens, open_brackets)
+            return repaired
+        except json.JSONDecodeError:
+            pass
+
+    # Return original text; caller will handle the parse error
+    return text
+
+
 def get_client() -> AsyncAnthropic:
     """Get or create the singleton AsyncAnthropic client."""
     global _client
     if _client is None:
         _client = AsyncAnthropic(api_key=settings.anthropic_api_key)
     return _client
+
+
+async def _api_call_with_backoff(
+    client: AsyncAnthropic,
+    *,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    system: str,
+    user_prompt: str,
+    max_retries: int = 3,
+):
+    """Make an Anthropic API call with semaphore + 429 backoff.
+
+    Retries up to max_retries times on RateLimitError with exponential backoff.
+    Backoff sleeps happen OUTSIDE the semaphore so other calls aren't blocked.
+    Wait starts at 30s to handle per-minute rate limits (30K input tokens/min).
+    """
+    for retry in range(max_retries + 1):
+        sem = _get_semaphore()
+        if sem.locked():
+            logger.info("API semaphore full, waiting for a slot...")
+        async with sem:
+            try:
+                logger.info("API call starting (semaphore acquired)")
+                return await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system,
+                    messages=[{"role": "user", "content": user_prompt}],
+                    timeout=settings.claude_timeout,
+                )
+            except RateLimitError as e:
+                if retry >= max_retries:
+                    raise
+                # Wait outside semaphore so other calls aren't blocked
+                wait = 30 * (2 ** retry)  # 30s, 60s, 120s
+                logger.warning(
+                    "Rate limited (429), retrying in %ds (attempt %d/%d): %s",
+                    wait, retry + 1, max_retries, str(e)[:100],
+                )
+        # Sleep outside semaphore block to release the slot during backoff
+        await asyncio.sleep(wait)
 
 
 async def call_claude(
@@ -176,19 +301,11 @@ async def call_claude(
     model = resolve_model_id(model)
 
     for attempt in range(2):  # 1 retry on parse failure
-        sem = _get_semaphore()
-        if sem.locked():
-            logger.info("API semaphore full, waiting for a slot...")
-        async with sem:
-            logger.info("API call starting (semaphore acquired)")
-            response = await client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-                timeout=settings.claude_timeout,
-            )
+        response = await _api_call_with_backoff(
+            client, model=model, max_tokens=max_tokens,
+            temperature=temperature, system=system_prompt,
+            user_prompt=user_prompt,
+        )
 
         # Track token usage (D-01, ATLAS-5)
         _track_token_usage(response)
@@ -197,14 +314,7 @@ async def call_claude(
 
         # Try to extract JSON from the response
         try:
-            # Handle markdown-wrapped JSON
-            if "```json" in text:
-                json_str = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                json_str = text.split("```")[1].split("```")[0].strip()
-            else:
-                json_str = text.strip()
-
+            json_str = _extract_json(text)
             data = json.loads(json_str)
             return response_model.model_validate(data)
         except Exception as e:
@@ -254,19 +364,11 @@ async def call_claude_raw(
     client = get_client()
     model = resolve_model_id(model)
 
-    sem = _get_semaphore()
-    if sem.locked():
-        logger.info("API semaphore full, waiting for a slot...")
-    async with sem:
-        logger.info("API call starting (semaphore acquired)")
-        response = await client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-            timeout=settings.claude_timeout,
-        )
+    response = await _api_call_with_backoff(
+        client, model=model, max_tokens=max_tokens,
+        temperature=temperature, system=system_prompt,
+        user_prompt=user_prompt,
+    )
 
     # Track token usage (D-01, ATLAS-5)
     _track_token_usage(response)

@@ -23,6 +23,7 @@ from app.routers import (
     personas,
     portfolio,
     search,
+    watchlist,
     workflows,
 )
 
@@ -32,11 +33,36 @@ logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
 
+def _run_schema_migrations():
+    """Alembic-free column migrations for additive changes.
+
+    Each migration checks for the column's existence and adds it if missing.
+    Safe to run on every startup — no-op if columns already exist.
+    """
+    try:
+        from sqlalchemy import text, inspect
+        with engine.connect() as conn:
+            inspector = inspect(engine)
+
+            # Gap 1: Add external_validation_results to hfrt_projects
+            existing_cols = {c["name"] for c in inspector.get_columns("hfrt_projects")}
+            if "external_validation_results" not in existing_cols:
+                conn.execute(
+                    text("ALTER TABLE hfrt_projects ADD COLUMN external_validation_results TEXT")
+                )
+                conn.commit()
+                logger.info("Migration: added external_validation_results to hfrt_projects")
+    except Exception as exc:
+        # Non-fatal: log and continue. Table may not exist yet on fresh DBs.
+        logger.warning("Schema migration warning (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create tables on startup if they don't exist."""
+    """Create tables on startup if they don't exist, then run additive migrations."""
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables verified.")
+    _run_schema_migrations()
     yield
 
 
@@ -70,6 +96,7 @@ app.include_router(hfrt.router)
 app.include_router(frameworks.router)
 app.include_router(personas.router)
 app.include_router(bridge.router)
+app.include_router(watchlist.router)
 
 # Register IST step handlers by importing the service modules
 from app.services.ist import content_extraction as _ist_content_extraction  # noqa: F401

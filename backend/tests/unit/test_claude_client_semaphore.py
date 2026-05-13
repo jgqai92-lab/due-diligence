@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from pydantic import BaseModel
 
 import app.services.claude_client as claude_client_module
+from app.services.claude_client import API_SEMAPHORE_LIMIT
 
 
 # ── Test response model ──────────────────────────────────────────────────────
@@ -91,13 +92,13 @@ class TestApiSemaphore:
 
             await asyncio.gather(*tasks)
 
-        # The semaphore allows at most 2 concurrent calls
-        assert max_concurrent <= 2, (
-            f"Expected at most 2 concurrent API calls, but saw {max_concurrent}"
+        # The semaphore allows at most API_SEMAPHORE_LIMIT concurrent calls
+        assert max_concurrent <= API_SEMAPHORE_LIMIT, (
+            f"Expected at most {API_SEMAPHORE_LIMIT} concurrent API calls, but saw {max_concurrent}"
         )
-        # With 5 tasks and semaphore=2, max should be exactly 2
-        assert max_concurrent == 2, (
-            f"Expected exactly 2 concurrent API calls (semaphore value), "
+        # With 5 tasks and semaphore=API_SEMAPHORE_LIMIT, max should be exactly the limit
+        assert max_concurrent == API_SEMAPHORE_LIMIT, (
+            f"Expected exactly {API_SEMAPHORE_LIMIT} concurrent API calls (semaphore value), "
             f"but saw {max_concurrent}"
         )
 
@@ -137,7 +138,7 @@ class TestApiSemaphore:
 
             results = await asyncio.gather(*tasks)
 
-        assert max_concurrent <= 2
+        assert max_concurrent <= API_SEMAPHORE_LIMIT
         assert all(r == "raw response text" for r in results)
 
     @pytest.mark.asyncio
@@ -149,8 +150,8 @@ class TestApiSemaphore:
         async def blocking_api_call(**kwargs):
             nonlocal call_count
             call_count += 1
-            if call_count <= 2:
-                # First two calls block until we signal
+            if call_count <= API_SEMAPHORE_LIMIT:
+                # First N calls block until we signal
                 await release_event.wait()
             return _make_fake_api_response()
 
@@ -159,7 +160,7 @@ class TestApiSemaphore:
 
         with patch("app.services.claude_client.get_client", return_value=mock_client):
             with caplog.at_level(logging.INFO, logger="app.services.claude_client"):
-                # Start 3 calls: 2 will acquire, 1 should wait
+                # Start N+1 calls: N will acquire, 1 should wait
                 tasks = [
                     asyncio.create_task(
                         claude_client_module.call_claude(
@@ -168,10 +169,10 @@ class TestApiSemaphore:
                             response_model=DummyResponse,
                         )
                     )
-                    for i in range(3)
+                    for i in range(API_SEMAPHORE_LIMIT + 1)
                 ]
 
-                # Give time for the first 2 to acquire and 3rd to hit the log
+                # Give time for the first N to acquire and (N+1)th to hit the log
                 await asyncio.sleep(0.1)
 
                 # Release all blocked calls
@@ -185,8 +186,8 @@ class TestApiSemaphore:
             if "semaphore full" in r.message.lower()
         ]
         assert len(semaphore_logs) >= 1, (
-            "Expected at least one 'semaphore full' log message when 3 calls "
-            "compete for 2 semaphore slots"
+            f"Expected at least one 'semaphore full' log message when {API_SEMAPHORE_LIMIT + 1} calls "
+            f"compete for {API_SEMAPHORE_LIMIT} semaphore slots"
         )
 
     @pytest.mark.asyncio
@@ -274,9 +275,9 @@ class TestApiSemaphore:
 
             await asyncio.gather(*tasks)
 
-        # Both function types share the semaphore, so max concurrent is still 2
-        assert max_concurrent <= 2, (
-            f"Expected at most 2 concurrent API calls across both function types, "
+        # Both function types share the semaphore, so max concurrent is still the limit
+        assert max_concurrent <= API_SEMAPHORE_LIMIT, (
+            f"Expected at most {API_SEMAPHORE_LIMIT} concurrent API calls across both function types, "
             f"but saw {max_concurrent}"
         )
 

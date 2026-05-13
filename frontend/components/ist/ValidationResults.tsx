@@ -199,7 +199,7 @@ function ValidationCard({ item }: { item: ValidationItem }) {
                 {item.searchQueries.map((q, idx) => (
                   <span
                     key={idx}
-                    className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono bg-white/10 text-text-secondary"
+                    className="inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-mono bg-white/10 text-text-secondary"
                   >
                     {q}
                   </span>

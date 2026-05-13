@@ -49,11 +49,11 @@ class TestTransformStatementBasic:
         assert revenue["values"][1] == 383285000000.0
 
     def test_preserves_line_item_order(self, sample_financials):
-        """Line items preserve first-seen order from yfinance data."""
+        """Line items are reversed so statements read in standard order (Revenue at bottom, detail items first)."""
         result = transform_statement(sample_financials)
         labels = [li["label"] for li in result["line_items"]]
-        # First-seen order from the most recent period dict
-        assert labels[0] == "Total Revenue"
+        # After reverse: detail items first, revenue-level items last
+        assert labels[-1] == "Total Revenue"
         assert "Gross Profit" in labels
         assert "Net Income" in labels
 

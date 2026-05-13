@@ -94,6 +94,7 @@ export default function ResearchDetailPage() {
   const {
     workflowStatus: sseStatus,
     steps: sseSteps,
+    reconnect: reconnectSSE,
   } = useWorkflowSSE({
     workflowId: project?.workflowRunId ?? null,
     onStepComplete: () => refreshData(),
@@ -212,10 +213,11 @@ export default function ResearchDetailPage() {
     try {
       await retryWorkflow(project.workflowRunId);
       await refreshData();
+      reconnectSSE();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to retry workflow");
     }
-  }, [project?.workflowRunId, refreshData]);
+  }, [project?.workflowRunId, refreshData, reconnectSSE]);
 
   // Auto-advance toggle
   const handleToggleAutoAdvance = useCallback(async (enabled: boolean) => {

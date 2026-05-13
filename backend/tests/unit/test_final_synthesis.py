@@ -39,6 +39,7 @@ from app.models.ist import (
     ISTValidation,
 )
 from app.services.ist.final_synthesis import (
+    CONTENT_TYPE_THRESHOLDS,
     CatalystCalendarResult,
     CatalystEvent,
     FrameworkTest,
@@ -51,9 +52,12 @@ from app.services.ist.final_synthesis import (
     RotationTrigger,
     StressTestResult,
     SurvivalScore,
+    _bottleneck_name_in_report,
     _build_full_data_package,
     _run_invariant_checks,
+    get_thresholds,
     handle_catalyst_calendar,
+    handle_hfrt_handoff_generation,
     handle_master_screen,
     handle_report_generation,
     handle_rotation_strategy,
@@ -919,9 +923,9 @@ class TestScreenCoherenceGate:
     @pytest.fixture
     def populated_screen(
         self, test_db, ist_screen, sample_claims, sample_bottlenecks,
-        sample_candidates,
+        sample_candidates, sample_dialectic_reviews,
     ):
-        """Create a screen with report and master screen for passing coherence."""
+        """Create a screen with all artifacts for passing coherence gate."""
         # Create master screen
         ranked_equities = json.dumps([
             {"rank": 1, "ticker": "NVDA", "tier": 1, "conviction_score": 92},
@@ -941,9 +945,43 @@ class TestScreenCoherenceGate:
             screen_id=ist_screen.id,
             title="Investment Thesis Report: GPU Scarcity Screen",
             content=_mock_report_content(),
-            report_metadata=json.dumps({"wordCount": 250}),
+            report_metadata=json.dumps({
+                "wordCount": 1500,
+                "pillarCount": 2,
+                "equityCount": 2,
+                "tier1Count": 1,
+                "tier2Count": 1,
+                "tier3Count": 0,
+            }),
         )
         test_db.add(report)
+
+        # Create rotation strategy (required by coherence gate check 6)
+        rotation = ISTRotationStrategy(
+            screen_id=ist_screen.id,
+            phase_allocations=json.dumps([]),
+            rotation_triggers=json.dumps([]),
+            risk_limits=json.dumps([]),
+        )
+        test_db.add(rotation)
+
+        # Create catalyst calendar (required by coherence gate check 7)
+        catalyst = ISTCatalystCalendar(
+            screen_id=ist_screen.id,
+            catalysts=json.dumps([]),
+            total_catalysts=0,
+        )
+        test_db.add(catalyst)
+
+        # Create stress tests (required by coherence gate check 8)
+        stress = ISTStressTest(
+            screen_id=ist_screen.id,
+            framework_tests=json.dumps([]),
+            name_tests=json.dumps([]),
+            survival_scores=json.dumps([]),
+        )
+        test_db.add(stress)
+
         test_db.commit()
 
         return ist_screen
@@ -1115,7 +1153,7 @@ class TestScreenCoherenceGate:
             new_callable=AsyncMock,
         ):
             test_db.close = lambda: None
-            with pytest.raises(ValueError, match="GPU Supply Scarcity.*not found"):
+            with pytest.raises(ValueError, match="GPU Supply Scarcity.*not sufficiently covered"):
                 await handle_screen_coherence_gate(workflow_run.id)
 
     @pytest.mark.asyncio
@@ -1202,11 +1240,12 @@ class TestScreenCertification:
         assert ist_screen.status == "COMPLETED"
 
     @pytest.mark.asyncio
-    async def test_certification_generates_handoff(
+    async def test_handoff_generation_produces_candidates(
         self, test_db, workflow_run, ist_screen,
         sample_claims, sample_bottlenecks, sample_candidates,
     ):
-        """Certification generates HFRT handoff with Tier 1 candidates."""
+        """HFRT handoff generation produces candidates from certified screen."""
+        # First certify the screen
         with patch(
             "app.services.ist.final_synthesis.SessionLocal",
             return_value=test_db,
@@ -1215,15 +1254,31 @@ class TestScreenCertification:
             new_callable=AsyncMock,
         ):
             test_db.close = lambda: None
-            result = await handle_screen_certification(workflow_run.id)
+            await handle_screen_certification(workflow_run.id)
 
-        handoff = result["hfrtHandoff"]
-        assert handoff["screenName"] == "GPU Scarcity Screen"
-        assert handoff["tier1Count"] == 1  # Only NVDA is Tier 1
-        assert len(handoff["candidates"]) == 1
-        assert handoff["candidates"][0]["ticker"] == "NVDA"
-        assert handoff["candidates"][0]["conviction"] == "HIGH"
-        assert handoff["candidates"][0]["pillar"] == "GPU Supply Scarcity"
+        # Now generate handoff
+        with patch(
+            "app.services.ist.final_synthesis.SessionLocal",
+            return_value=test_db,
+        ), patch(
+            "app.services.ist.final_synthesis.emit_sse_event",
+            new_callable=AsyncMock,
+        ):
+            test_db.close = lambda: None
+            result = await handle_hfrt_handoff_generation(workflow_run.id)
+
+        assert result is not None
+        assert result["screenName"] == "GPU Scarcity Screen"
+        # All candidates (both tiers) included in handoff
+        assert result["tier1Count"] == 2  # Both NVDA and EATON
+        assert "NVDA" in result["candidates"]
+
+        # Verify handoff stored on screen
+        test_db.refresh(ist_screen)
+        import json as _json
+        handoff_data = _json.loads(ist_screen.hfrt_handoff)
+        assert handoff_data["screenName"] == "GPU Scarcity Screen"
+        assert len(handoff_data["candidates"]) == 2
 
     @pytest.mark.asyncio
     async def test_certification_no_screen_raises(self, test_db):
@@ -1393,3 +1448,191 @@ class TestPydanticModels:
         parsed = json.loads(pa_json)
         for item in parsed:
             PhaseAllocation.model_validate(item)
+
+
+# -- Content-Type-Aware Threshold Tests -------------------------------------
+
+
+class TestContentTypeThresholds:
+    """Tests for CONTENT_TYPE_THRESHOLDS and get_thresholds()."""
+
+    def test_all_five_content_types_defined(self):
+        expected = {"earnings_call", "research_note", "article", "podcast_transcript", "text"}
+        assert set(CONTENT_TYPE_THRESHOLDS.keys()) == expected
+
+    def test_earnings_call_strictest_inv2(self):
+        t = get_thresholds("earnings_call")
+        assert t["inv2_quant_pct"] == 50
+
+    def test_text_lowest_inv2(self):
+        t = get_thresholds("text")
+        assert t["inv2_quant_pct"] == 20
+
+    def test_podcast_inv2_below_article(self):
+        podcast = get_thresholds("podcast_transcript")["inv2_quant_pct"]
+        article = get_thresholds("article")["inv2_quant_pct"]
+        assert podcast < article
+
+    def test_fallback_for_unknown_type(self):
+        t = get_thresholds("unknown_type")
+        assert t["inv2_quant_pct"] == 40
+        assert t["bottleneck_kw"] == 0.60
+
+    def test_fallback_for_none(self):
+        t = get_thresholds(None)
+        assert t["inv2_quant_pct"] == 40
+
+    def test_bottleneck_kw_decreases_for_qualitative_types(self):
+        ec = get_thresholds("earnings_call")["bottleneck_kw"]
+        txt = get_thresholds("text")["bottleneck_kw"]
+        assert ec > txt
+
+    def test_all_thresholds_have_required_keys(self):
+        for ct, t in CONTENT_TYPE_THRESHOLDS.items():
+            assert "inv2_quant_pct" in t, f"{ct} missing inv2_quant_pct"
+            assert "bottleneck_kw" in t, f"{ct} missing bottleneck_kw"
+
+
+class TestInvariantChecksContentTypeAware:
+    """Tests that _run_invariant_checks uses content-type thresholds for INV-2."""
+
+    def test_inv2_passes_with_text_content_type(
+        self, test_db, ist_screen,
+    ):
+        """33% quant anchors should PASS for 'text' (threshold 20%)."""
+        ist_screen.content_type = "text"
+        test_db.flush()
+
+        # Add 3 claims: 1 with quant anchor, 2 without = 33%
+        for i in range(3):
+            test_db.add(ISTClaim(
+                screen_id=ist_screen.id,
+                claim_text=f"Claim {i}",
+                source_citation=f"Source {i}",
+                quantitative_anchor=f"$100M" if i == 0 else None,
+                temporal_marker="2025" if i == 0 else None,
+                confidence=0.8,
+            ))
+        test_db.commit()
+
+        invariants = _run_invariant_checks(
+            test_db, ist_screen.id, content_type="text"
+        )
+        inv2 = next(i for i in invariants if i["id"] == "INV-2")
+        assert inv2["status"] == "PASS"
+        assert "[text]" in inv2["details"]
+
+    def test_inv2_fails_with_earnings_call_content_type(
+        self, test_db, ist_screen,
+    ):
+        """33% quant anchors should FAIL for 'earnings_call' (threshold 50%)."""
+        ist_screen.content_type = "earnings_call"
+        test_db.flush()
+
+        for i in range(3):
+            test_db.add(ISTClaim(
+                screen_id=ist_screen.id,
+                claim_text=f"Claim {i}",
+                source_citation=f"Source {i}",
+                quantitative_anchor=f"$100M" if i == 0 else None,
+                temporal_marker="2025" if i == 0 else None,
+                confidence=0.8,
+            ))
+        test_db.commit()
+
+        invariants = _run_invariant_checks(
+            test_db, ist_screen.id, content_type="earnings_call"
+        )
+        inv2 = next(i for i in invariants if i["id"] == "INV-2")
+        assert inv2["status"] == "FAIL"
+        assert "[earnings_call]" in inv2["details"]
+
+    def test_inv2_without_content_type_uses_default(
+        self, test_db, ist_screen, sample_claims,
+    ):
+        """Without content_type, uses default 40% threshold."""
+        invariants = _run_invariant_checks(test_db, ist_screen.id)
+        inv2 = next(i for i in invariants if i["id"] == "INV-2")
+        # sample_claims has 2/2 quant anchors = 100%, passes regardless
+        assert inv2["status"] == "PASS"
+        # No content type label in details
+        assert "[" not in inv2["details"]
+
+    def test_inv2_detail_shows_threshold(
+        self, test_db, ist_screen,
+    ):
+        """Detail message should reflect the content-type-specific threshold."""
+        test_db.add(ISTClaim(
+            screen_id=ist_screen.id,
+            claim_text="Claim",
+            source_citation="Source",
+            quantitative_anchor="$1B",
+            confidence=0.8,
+        ))
+        test_db.commit()
+
+        invariants = _run_invariant_checks(
+            test_db, ist_screen.id, content_type="podcast_transcript"
+        )
+        inv2 = next(i for i in invariants if i["id"] == "INV-2")
+        assert ">= 25%" in inv2["details"]
+
+
+class TestBottleneckNameInReport:
+    """Tests for _bottleneck_name_in_report with configurable threshold."""
+
+    def test_default_threshold_60_pct(self):
+        """Default 60% threshold: 3/5 key words needed."""
+        name = "Advanced GPU Supply Chain Bottleneck"
+        content = "The advanced GPU supply issues are growing."
+        passed, missing = _bottleneck_name_in_report(name, content)
+        # key words (>=4 chars): advanced, supply, chain, bottleneck = 4
+        # found: advanced, supply = 2, need ceil(4*0.6) = 3, so FAIL
+        assert passed is False
+        assert "chain" in missing
+        assert "bottleneck" in missing
+
+    def test_lower_threshold_40_pct(self):
+        """With 40% threshold: 2/4 key words needed for same name."""
+        name = "Advanced GPU Supply Chain Bottleneck"
+        content = "The advanced GPU supply issues are growing."
+        passed, missing = _bottleneck_name_in_report(
+            name, content, coverage_threshold=0.4
+        )
+        # key words: advanced, supply, chain, bottleneck = 4
+        # found: advanced, supply = 2, need ceil(4*0.4) = 2, so PASS
+        assert passed is True
+
+    def test_abstract_name_fails_at_60_passes_at_40(self):
+        """Ontological name (like AWG Ted Talk) fails strict, passes lenient."""
+        name = "Ontological Civilizational Adaptation Bottleneck"
+        content = "civilization must adapt through ontological transformation"
+        # key words: ontological, civilizational, adaptation, bottleneck = 4
+        # found in content (case-insensitive): ontological = yes,
+        # civilizational (NOT civilization) = no, adaptation = no (adapt != adaptation),
+        # bottleneck = no
+        # Actually let me check: "adaptation" not in content, "civilizational" not in content
+        # So found=1, need ceil(4*0.6)=3 -> FAIL
+        passed_strict, _ = _bottleneck_name_in_report(name, content)
+        assert passed_strict is False
+
+        # With 0.25 threshold: need ceil(4*0.25)=1 -> PASS
+        passed_lenient, _ = _bottleneck_name_in_report(
+            name, content, coverage_threshold=0.25
+        )
+        assert passed_lenient is True
+
+    def test_short_name_fallback_ignores_threshold(self):
+        """Names with no key words (all < 4 chars) use substring match."""
+        name = "AI GPU"
+        content = "The AI GPU market is booming."
+        passed, missing = _bottleneck_name_in_report(name, content)
+        assert passed is True
+        assert missing == []
+
+    def test_case_insensitive(self):
+        """Matching is case-insensitive."""
+        name = "Power Infrastructure Constraint"
+        content = "the POWER INFRASTRUCTURE constraint is binding"
+        passed, _ = _bottleneck_name_in_report(name, content)
+        assert passed is True

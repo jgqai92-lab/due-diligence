@@ -9,22 +9,22 @@ Tests cover:
 """
 
 
-# All 7 expected framework names in definition order.
+# All 7 expected framework names in alphabetical order (glob-sorted from disk).
 EXPECTED_NAMES = [
-    "scarcity_scoring",
-    "bottleneck_cascade",
+    "analytical_parallels",
     "demand_modeling",
-    "external_validation",
-    "dialectic_scrutiny",
-    "effects_mapping",
-    "stress_testing",
+    "multi_order_effects",
+    "null_hypothesis",
+    "scar_tissue_thesis",
+    "scarcity_abundance",
+    "sequential_bottleneck",
 ]
 
 # Fields that MUST appear in list summaries.
 SUMMARY_FIELDS = {"name", "displayName", "description", "category"}
 
 # Additional fields that MUST appear in detail responses.
-DETAIL_EXTRA_FIELDS = {"content", "scoringSchema"}
+DETAIL_EXTRA_FIELDS = {"content"}
 
 
 # ── GET /api/frameworks/ist ──────────────────────────────────────────────────
@@ -65,7 +65,10 @@ class TestListISTFrameworks:
             )
 
     def test_list_categories_are_valid(self, client):
-        valid_categories = {"equity_analysis", "thematic_analysis", "quality_assurance"}
+        valid_categories = {
+            "equity_analysis", "thematic_analysis", "quality_assurance",
+            "conviction_building", "idea_generation", "behavioral_analysis",
+        }
         data = client.get("/api/frameworks/ist").json()
         for fw in data["frameworks"]:
             assert fw["category"] in valid_categories, (
@@ -95,37 +98,31 @@ class TestGetISTFrameworkDetail:
                 f"Content too short for '{name}' -- likely empty"
             )
 
-    def test_detail_includes_scoring_schema(self, client):
-        """Detail response must include scoringSchema (may be None)."""
+    def test_detail_includes_classification(self, client):
+        """Detail response must include classification metadata."""
         for name in EXPECTED_NAMES:
             data = client.get(f"/api/frameworks/ist/{name}").json()
-            assert "scoringSchema" in data, f"Missing 'scoringSchema' for '{name}'"
+            assert "classification" in data, f"Missing 'classification' for '{name}'"
 
-    def test_scarcity_scoring_has_non_null_schema(self, client):
-        """scarcity_scoring is the only framework with a populated scoringSchema."""
-        data = client.get("/api/frameworks/ist/scarcity_scoring").json()
-        schema = data["scoringSchema"]
-        assert schema is not None
-        assert "dimensions" in schema
-        assert len(schema["dimensions"]) == 5
-        assert schema["scale"]["min"] == 1
-        assert schema["scale"]["max"] == 5
-        assert schema["tierThresholds"]["tier1"] == 4.0
-        assert schema["tierThresholds"]["tier2"] == 3.0
+    def test_scarcity_abundance_is_default_framework(self, client):
+        """scarcity_abundance is the default screening framework."""
+        data = client.get("/api/frameworks/ist/scarcity_abundance").json()
+        assert data["category"] == "equity_analysis"
+        assert "Scarcity" in data["displayName"]
+        # Content includes scoring dimensions
+        assert "Physical Constraint" in data["content"]
+        assert "Pricing Power" in data["content"]
 
-    def test_non_scarcity_frameworks_have_null_schema(self, client):
-        """All frameworks except scarcity_scoring have scoringSchema=None."""
+    def test_each_framework_has_version(self, client):
+        """All frameworks include a version string."""
         for name in EXPECTED_NAMES:
-            if name == "scarcity_scoring":
-                continue
             data = client.get(f"/api/frameworks/ist/{name}").json()
-            assert data["scoringSchema"] is None, (
-                f"Expected null scoringSchema for '{name}'"
-            )
+            assert "version" in data, f"Missing 'version' for '{name}'"
+            assert data["version"], f"Empty version for '{name}'"
 
     def test_detail_includes_summary_fields(self, client):
         """Detail response also includes the summary fields."""
-        data = client.get("/api/frameworks/ist/scarcity_scoring").json()
+        data = client.get("/api/frameworks/ist/scarcity_abundance").json()
         for field in SUMMARY_FIELDS:
             assert field in data
 

@@ -96,23 +96,56 @@ def fetch_filing(
 
         content_h = _content_hash(content)
 
-        # Check if this exact content is already cached
+        # Check if this exact content is already cached (hash dedup)
         db = SessionLocal()
         try:
-            existing = (
+            existing_by_hash = (
                 db.query(HFRTSECFiling)
                 .filter(HFRTSECFiling.content_hash == content_h)
                 .first()
             )
-            if existing:
+            if existing_by_hash:
                 logger.info("Cache hit for %s %s (hash match)", ticker, filing_type)
                 return {
                     "success": True,
                     "cached": True,
-                    "filing_id": existing.id,
+                    "filing_id": existing_by_hash.id,
                     "filing_type": filing_type,
-                    "filing_date": existing.filing_date,
-                    "content_length": len(existing.content or ""),
+                    "filing_date": existing_by_hash.filing_date,
+                    "content_length": len(existing_by_hash.content or ""),
+                }
+
+            # Check for existing filing by (project_id, filing_type) — upsert in-place
+            existing_by_project = (
+                db.query(HFRTSECFiling)
+                .filter(
+                    HFRTSECFiling.project_id == project_id,
+                    HFRTSECFiling.filing_type == filing_type,
+                )
+                .first()
+            )
+            if existing_by_project:
+                # Update in-place instead of inserting a duplicate
+                import datetime as _dt
+                existing_by_project.content_hash = content_h
+                existing_by_project.content = content
+                existing_by_project.filing_date = filing_date
+                existing_by_project.accession_number = accession_number
+                existing_by_project.fetched_at = _dt.datetime.now(_dt.timezone.utc)
+                db.commit()
+                db.refresh(existing_by_project)
+                logger.info(
+                    "Upserted filing for project %d %s %s",
+                    project_id, ticker, filing_type,
+                )
+                return {
+                    "success": True,
+                    "cached": False,
+                    "updated": True,
+                    "filing_id": existing_by_project.id,
+                    "filing_type": filing_type,
+                    "filing_date": filing_date,
+                    "content_length": len(content),
                 }
 
             # Save new filing
@@ -133,6 +166,7 @@ def fetch_filing(
             return {
                 "success": True,
                 "cached": False,
+                "updated": False,
                 "filing_id": filing_record.id,
                 "filing_type": filing_type,
                 "filing_date": filing_date,

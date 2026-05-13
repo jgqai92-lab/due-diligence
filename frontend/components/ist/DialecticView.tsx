@@ -23,7 +23,24 @@ import {
   Minus,
 } from "lucide-react";
 
-// ─── Conviction Badge Config ────────────────────────────────────────
+// ─── Title/Description Splitter ─────────────────────────────────────
+// Detects "ALL CAPS TITLE: explanation…" pattern and splits into parts.
+// Falls back to null for plain sentences (e.g. screen 1 data).
+
+function splitTitleDescription(
+  text: string
+): { title: string; description: string } | null {
+  // Match "ALL CAPS TITLE: explanation" or "ALL CAPS TITLE — explanation"
+  const match = text.match(/^([A-Z][A-Z0-9\s\-./&,()]+?)[\s]*[\u2014\u2013:]\s+([\s\S]+)/);
+  if (!match) return null;
+  const title = match[1].trim();
+  if (title.length < 3) return null;
+  return { title, description: match[2].trim() };
+}
+
+// ─── Conviction Level Parser ────────────────────────────────────────
+// Claude sometimes returns "HIGH — long explanation" or "HIGH: explanation"
+// instead of just "HIGH". Parse out the label and the summary.
 
 const CONVICTION_COLORS: Record<string, { bg: string; text: string }> = {
   HIGH:   { bg: "bg-emerald-500/10", text: "text-emerald-400" },
@@ -31,9 +48,29 @@ const CONVICTION_COLORS: Record<string, { bg: string; text: string }> = {
   LOW:    { bg: "bg-white/10", text: "text-text-secondary" },
 };
 
+// Map alternative level words to canonical labels
+const LEVEL_ALIASES: Record<string, string> = {
+  HIGH: "HIGH", MEDIUM: "MEDIUM", LOW: "LOW",
+  MODERATE: "MEDIUM", VERY_HIGH: "HIGH", VERY_LOW: "LOW",
+};
+
+function parseConvictionLevel(raw: string): { label: string; summary: string | null } {
+  // Match "HIGH — explanation", "MODERATE - explanation", etc.
+  const match = raw.match(/^(\w[\w\s]*?)\s*[\u2014\u2013\-:]\s+([\s\S]+)/);
+  if (match) {
+    const word = match[1].trim().toUpperCase().replace(/\s+/g, "_");
+    const label = LEVEL_ALIASES[word] ?? word;
+    return { label, summary: match[2].trim() };
+  }
+  // Already clean: just "HIGH" or "MODERATE"
+  const upper = raw.trim().toUpperCase().replace(/\s+/g, "_");
+  const label = LEVEL_ALIASES[upper] ?? upper;
+  return { label, summary: null };
+}
+
 function ConvictionBadge({ level }: { level: string }) {
-  const upper = level.toUpperCase();
-  const config = CONVICTION_COLORS[upper] ?? CONVICTION_COLORS.LOW;
+  const { label } = parseConvictionLevel(level);
+  const config = CONVICTION_COLORS[label] ?? CONVICTION_COLORS.LOW;
   return (
     <span
       className={cn(
@@ -42,7 +79,7 @@ function ConvictionBadge({ level }: { level: string }) {
         config.text
       )}
     >
-      {level}
+      {label}
     </span>
   );
 }
@@ -116,7 +153,7 @@ function TierAdjustmentTable({
                     )}
                   </span>
                 </td>
-                <td className="px-3 py-2 text-[11px] text-text-secondary leading-relaxed max-w-[300px]">
+                <td className="px-3 py-2 text-[11px] text-text-secondary leading-relaxed">
                   {adj.rationale}
                 </td>
               </tr>
@@ -158,6 +195,99 @@ function CollapsibleNarrative({
         <div className="mt-2 p-3 bg-white/5 rounded-lg border border-border">
           <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">
             {narrative}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Collapsible Argument (title-only by default) ──────────────────
+
+function CollapsibleArgument({
+  title,
+  description,
+  accentColor,
+  dotColor,
+}: {
+  title: string;
+  description: string;
+  accentColor: string;
+  dotColor: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div role="listitem">
+      <button
+        onClick={() => setOpen(!open)}
+        className={cn(
+          "w-full flex items-start gap-2 py-1 text-left",
+          "hover:bg-white/5 rounded transition-colors duration-100",
+          "focus:outline-none focus:ring-1 focus:ring-primary rounded"
+        )}
+        aria-expanded={open}
+      >
+        <span
+          className={cn("w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0", dotColor)}
+          aria-hidden="true"
+        />
+        <span className={cn("text-xs font-semibold leading-snug flex-1 min-w-0", accentColor)}>
+          {title}
+        </span>
+        {open ? (
+          <ChevronUp size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        ) : (
+          <ChevronDown size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        )}
+      </button>
+      {open && (
+        <div className="ml-3.5 pl-2 border-l border-border mt-0.5 mb-1">
+          <p className="text-xs text-text-secondary leading-relaxed">
+            {description}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Collapsible Risk (title-only by default) ──────────────────────
+
+function CollapsibleRisk({
+  title,
+  description,
+}: {
+  title: string;
+  description: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div role="listitem">
+      <button
+        onClick={() => setOpen(!open)}
+        className={cn(
+          "w-full flex items-start gap-2 py-1 text-left",
+          "hover:bg-white/5 rounded transition-colors duration-100",
+          "focus:outline-none focus:ring-1 focus:ring-primary rounded"
+        )}
+        aria-expanded={open}
+      >
+        <AlertTriangle size={12} className="flex-shrink-0 text-amber-400 mt-0.5" aria-hidden="true" />
+        <span className="text-xs font-semibold text-amber-400 leading-snug flex-1 min-w-0">
+          {title}
+        </span>
+        {open ? (
+          <ChevronUp size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        ) : (
+          <ChevronDown size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        )}
+      </button>
+      {open && (
+        <div className="ml-3.5 pl-2 border-l border-amber-500/30 mt-0.5 mb-1">
+          <p className="text-xs text-amber-400/80 leading-relaxed">
+            {description}
           </p>
         </div>
       )}
@@ -240,28 +370,54 @@ function SidePanel({
         <ConvictionBadge level={review.content.convictionLevel} />
       </div>
 
+      {/* Conviction Summary (extracted from conviction_level field) */}
+      {(() => {
+        const { summary } = parseConvictionLevel(review.content.convictionLevel);
+        if (!summary) return null;
+        return (
+          <div className={cn("mb-4 p-3 rounded-lg border", accentBg, accentBorder)}>
+            <p className="text-[11px] font-medium text-text-secondary mb-1">Summary</p>
+            <p className="text-xs text-text-primary leading-relaxed">{summary}</p>
+          </div>
+        );
+      })()}
+
       {/* Key Arguments */}
       {review.content.keyArguments.length > 0 && (
         <div className="mb-4">
           <p className="text-[11px] font-medium text-text-secondary mb-2">
-            Key Arguments
+            Key Arguments ({review.content.keyArguments.length})
           </p>
-          <ul className="space-y-1.5" role="list">
-            {review.content.keyArguments.map((arg, idx) => (
-              <li key={idx} className="flex items-start gap-2">
-                <span
-                  className={cn(
-                    "w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0",
-                    isOptimist ? "bg-emerald-400" : "bg-red-400"
-                  )}
-                  aria-hidden="true"
+          <div className="space-y-1" role="list">
+            {review.content.keyArguments.map((arg, idx) => {
+              const parsed = splitTitleDescription(arg);
+              if (!parsed) {
+                return (
+                  <div key={idx} role="listitem" className="flex items-start gap-2 py-1">
+                    <span
+                      className={cn(
+                        "w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0",
+                        isOptimist ? "bg-emerald-400" : "bg-red-400"
+                      )}
+                      aria-hidden="true"
+                    />
+                    <span className="text-xs text-text-primary leading-relaxed">
+                      {arg}
+                    </span>
+                  </div>
+                );
+              }
+              return (
+                <CollapsibleArgument
+                  key={idx}
+                  title={parsed.title}
+                  description={parsed.description}
+                  accentColor={isOptimist ? "text-emerald-400" : "text-red-400"}
+                  dotColor={isOptimist ? "bg-emerald-400" : "bg-red-400"}
                 />
-                <span className="text-xs text-text-primary leading-relaxed">
-                  {arg}
-                </span>
-              </li>
-            ))}
-          </ul>
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -338,71 +494,74 @@ function SynthesisSection({ synthesis }: { synthesis: SynthesisReview | null }) 
         <ConvictionBadge level={syn.overallConviction} />
       </div>
 
+      {/* Conviction Summary */}
+      {(() => {
+        const { summary } = parseConvictionLevel(syn.overallConviction);
+        if (!summary) return null;
+        return (
+          <div className="mb-4 p-3 rounded-lg border bg-violet-500/10 border-violet-500/30">
+            <p className="text-[11px] font-medium text-text-secondary mb-1">Summary</p>
+            <p className="text-xs text-text-primary leading-relaxed">{summary}</p>
+          </div>
+        );
+      })()}
+
       {/* Key Risks */}
       {syn.keyRisks.length > 0 && (
         <div className="mb-4">
-          <p className="text-[11px] font-medium text-text-secondary mb-2">Key Risks</p>
-          <div className="flex flex-wrap gap-1.5">
-            {syn.keyRisks.map((risk, idx) => (
-              <span
-                key={idx}
-                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30"
-              >
-                <AlertTriangle size={10} className="flex-shrink-0" aria-hidden="true" />
-                {risk}
-              </span>
-            ))}
+          <p className="text-[11px] font-medium text-text-secondary mb-2">
+            Key Risks ({syn.keyRisks.length})
+          </p>
+          <div className="space-y-1" role="list">
+            {syn.keyRisks.map((risk, idx) => {
+              const parsed = splitTitleDescription(risk);
+              if (!parsed) {
+                return (
+                  <div key={idx} role="listitem" className="flex items-start gap-2 py-1">
+                    <AlertTriangle size={12} className="flex-shrink-0 text-amber-400 mt-0.5" aria-hidden="true" />
+                    <span className="text-xs text-amber-400 leading-relaxed">
+                      {risk}
+                    </span>
+                  </div>
+                );
+              }
+              return <CollapsibleRisk key={idx} title={parsed.title} description={parsed.description} />;
+            })}
           </div>
         </div>
       )}
 
-      {/* Disagreements Table */}
+      {/* Disagreements */}
       {syn.disagreements.length > 0 && (
         <div className="mb-4">
-          <p className="text-[11px] font-medium text-text-secondary mb-2">Disagreements</p>
-          <div className="overflow-x-auto rounded-lg border border-border">
-            <table className="w-full text-left" role="table">
-              <thead>
-                <tr className="bg-white/5 border-b border-border">
-                  <th className="px-3 py-2 text-[11px] font-medium text-text-secondary" scope="col">
-                    Topic
-                  </th>
-                  <th className="px-3 py-2 text-[11px] font-medium text-emerald-400" scope="col">
-                    Optimist View
-                  </th>
-                  <th className="px-3 py-2 text-[11px] font-medium text-red-400" scope="col">
-                    Pessimist View
-                  </th>
-                  <th className="px-3 py-2 text-[11px] font-medium text-violet-400" scope="col">
-                    Resolution
-                  </th>
-                  <th className="px-3 py-2 text-[11px] font-medium text-text-secondary" scope="col">
-                    Tier Impact
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {syn.disagreements.map((d: Disagreement, idx: number) => (
-                  <tr key={idx} className="border-b border-border">
-                    <td className="px-3 py-2 text-xs font-medium text-text-primary">
-                      {d.topic}
-                    </td>
-                    <td className="px-3 py-2 text-[11px] text-emerald-400 leading-relaxed max-w-[180px]">
-                      {d.optimistView}
-                    </td>
-                    <td className="px-3 py-2 text-[11px] text-red-400 leading-relaxed max-w-[180px]">
-                      {d.pessimistView}
-                    </td>
-                    <td className="px-3 py-2 text-[11px] text-violet-400 leading-relaxed max-w-[180px]">
-                      {d.resolution}
-                    </td>
-                    <td className="px-3 py-2 text-[11px] text-text-secondary leading-relaxed max-w-[120px]">
-                      {d.impactOnTiers}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <p className="text-[11px] font-medium text-text-secondary mb-2">
+            Disagreements ({syn.disagreements.length})
+          </p>
+          <div className="space-y-2">
+            {syn.disagreements.map((d: Disagreement, idx: number) => (
+              <div key={idx} className="border border-border rounded-lg p-3 space-y-2">
+                <p className="text-xs font-medium text-text-primary">{d.topic}</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div>
+                    <p className="text-[10px] font-medium text-emerald-400 uppercase tracking-wider mb-0.5">Optimist</p>
+                    <p className="text-[11px] text-text-primary leading-relaxed">{d.optimistView}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-medium text-red-400 uppercase tracking-wider mb-0.5">Pessimist</p>
+                    <p className="text-[11px] text-text-primary leading-relaxed">{d.pessimistView}</p>
+                  </div>
+                </div>
+                <div className="pt-2 border-t border-border">
+                  <p className="text-[10px] font-medium text-violet-400 uppercase tracking-wider mb-0.5">Resolution</p>
+                  <p className="text-[11px] text-text-primary leading-relaxed">{d.resolution}</p>
+                </div>
+                {d.impactOnTiers && (
+                  <p className="text-[11px] text-text-secondary leading-relaxed">
+                    <span className="font-medium">Tier Impact:</span> {d.impactOnTiers}
+                  </p>
+                )}
+              </div>
+            ))}
           </div>
         </div>
       )}

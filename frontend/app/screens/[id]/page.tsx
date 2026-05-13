@@ -126,6 +126,7 @@ export default function ScreenDetailPage() {
   const {
     workflowStatus: sseStatus,
     steps: sseSteps,
+    reconnect: reconnectSSE,
   } = useWorkflowSSE({
     workflowId: activeWorkflowRunId,
     onWorkflowComplete: () => refreshScreen(),
@@ -292,10 +293,11 @@ export default function ScreenDetailPage() {
     try {
       await retryWorkflow(activeWorkflowRunId);
       await refreshScreen();
+      reconnectSSE();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to retry workflow");
     }
-  }, [activeWorkflowRunId, refreshScreen]);
+  }, [activeWorkflowRunId, refreshScreen, reconnectSSE]);
 
   // Auto-advance toggle handler
   const handleToggleAutoAdvance = useCallback(async (enabled: boolean) => {

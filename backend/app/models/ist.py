@@ -297,6 +297,8 @@ class ISTDemandModel(Base):
     bear_case = Column(Text, nullable=False)  # JSON
     sensitivity_table = Column(Text, nullable=True)  # JSON
     multiplier_chain = Column(Text, nullable=True)
+    methodology = Column(Text, nullable=True)
+    sources = Column(Text, nullable=True)  # JSON array of source strings
     created_at = Column(
         DateTime, nullable=False, default=lambda: datetime.now(timezone.utc)
     )
@@ -332,6 +334,7 @@ class ISTValidation(Base):
     evidence = Column(Text, nullable=False)
     sources = Column(Text, nullable=False)  # JSON
     search_queries = Column(Text, nullable=True)  # JSON
+    reasoning = Column(Text, nullable=True)  # Step-by-step verification trace
     validated_at = Column(
         DateTime, nullable=False, default=lambda: datetime.now(timezone.utc)
     )

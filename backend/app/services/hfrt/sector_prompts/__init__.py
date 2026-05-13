@@ -59,7 +59,9 @@ Analyze the industry/sector for the given company, covering:
 10. Cyclicality assessment
 11. Recent M&A activity
 
-NEVER fabricate data. Return ONLY valid JSON matching the schema provided."""
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate market size figures, competitor data, or industry benchmarks not present in the provided context.
+Return ONLY valid JSON matching the schema provided."""
 
 _GENERIC_KPIS = [
     "Revenue growth",

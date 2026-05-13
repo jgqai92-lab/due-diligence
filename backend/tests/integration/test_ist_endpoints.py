@@ -99,7 +99,7 @@ class TestCreateScreen:
         assert steps[0].phase_name == "Content Extraction"
         assert steps[0].step_order == 1
         assert steps[0].status == "PENDING"
-        assert steps[0].model_tier == "opus"
+        assert steps[0].model_tier == "sonnet"
 
         assert steps[-1].step_name == "hfrt_handoff_generation"
         assert steps[-1].phase == 5

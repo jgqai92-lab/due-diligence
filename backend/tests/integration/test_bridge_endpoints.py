@@ -23,6 +23,8 @@ SAMPLE_HANDOFF = {
     "screenId": 1,
     "certifiedAt": "2026-02-12T10:00:00Z",
     "tier1Count": 2,
+    "totalCount": 2,
+    "tierBreakdown": {"tier1": 2, "tier2": 0, "tier3": 0},
     "candidates": [
         {
             "ticker": "NVDA",
@@ -86,7 +88,7 @@ def _create_uncertified_screen(db) -> ISTScreen:
     screen = ISTScreen(
         workflow_run_id=run.id,
         name="Uncertified Screen",
-        status="RUNNING",
+        status="ANALYZING",
         content_type="text",
         raw_content="Test content.",
         is_certified=0,
@@ -190,13 +192,13 @@ class TestCreateHFRTProjects:
         assert run.workflow_type == "HFRT"
         assert "IST Handoff" in run.name
 
-        # Verify 23 workflow steps created
+        # Verify 24 workflow steps created (Gap 1: external_validation added)
         steps = (
             db.query(WorkflowStep)
             .filter(WorkflowStep.workflow_run_id == run.id)
             .all()
         )
-        assert len(steps) == 23
+        assert len(steps) == 24
 
         # Verify 15 templates created
         templates = (
@@ -336,6 +338,8 @@ class TestCreateHFRTProjects:
             "screenId": 1,
             "certifiedAt": "2026-02-12T10:00:00Z",
             "tier1Count": 1,
+            "totalCount": 1,
+            "tierBreakdown": {"tier1": 1, "tier2": 0, "tier3": 0},
             "candidates": [
                 {
                     "ticker": "AMD",
@@ -461,4 +465,4 @@ class TestBridgeServiceUnit:
             .filter(WorkflowStep.workflow_run_id == result["workflowRunId"])
             .all()
         )
-        assert len(steps) == 23
+        assert len(steps) == 24  # Gap 1: external_validation added

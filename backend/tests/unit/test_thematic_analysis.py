@@ -506,6 +506,9 @@ class TestExternalValidation:
             "app.services.ist.thematic_analysis.SessionLocal",
             return_value=test_db,
         ), patch(
+            "app.services.ist.thematic_analysis.perplexity_available",
+            return_value=False,
+        ), patch(
             "app.services.ist.thematic_analysis.call_claude",
             new_callable=AsyncMock,
             return_value=mock_result,
@@ -584,6 +587,9 @@ class TestExternalValidation:
         with patch(
             "app.services.ist.thematic_analysis.SessionLocal",
             return_value=test_db,
+        ), patch(
+            "app.services.ist.thematic_analysis.perplexity_available",
+            return_value=False,
         ), patch(
             "app.services.ist.thematic_analysis.call_claude",
             new_callable=AsyncMock,

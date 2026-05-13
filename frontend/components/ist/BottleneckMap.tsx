@@ -73,12 +73,12 @@ function BottleneckCard({ bottleneck }: { bottleneck: Bottleneck }) {
       {/* Badges */}
       <div className="flex flex-wrap gap-1.5">
         {bottleneck.quantitativeEvidence && (
-          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-mono bg-violet-500/10 text-violet-400">
+          <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-mono bg-violet-500/10 text-violet-400">
             {bottleneck.quantitativeEvidence}
           </span>
         )}
         {bottleneck.temporalMarker && (
-          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-sky-500/10 text-sky-400">
+          <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs bg-sky-500/10 text-sky-400">
             {bottleneck.temporalMarker}
           </span>
         )}

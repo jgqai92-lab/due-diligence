@@ -17,7 +17,9 @@ Analyze the industry for the given company with deep sector expertise:
 11. **Geopolitical**: OPEC+ dynamics, trade routes, sanctions, resource nationalism
 12. **Capital allocation**: Free cash flow yield, shareholder return framework, balance sheet capacity
 
-NEVER fabricate data. Cite sources where possible. Return ONLY valid JSON matching the schema."""
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate commodity price decks, reserve estimates, or regulatory details not present in the provided context.
+Return ONLY valid JSON matching the schema."""
 
 KPIS = [
     "F&D Cost per BOE (E&P)",

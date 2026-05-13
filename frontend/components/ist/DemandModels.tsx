@@ -4,25 +4,78 @@ import { useState, useEffect, useCallback } from "react";
 import { cn } from "@/lib/utils";
 import { getDemandModels } from "@/lib/api/ist";
 import type { DemandModel, DemandModelsResponse } from "@/types/ist";
-import { AlertCircle, Loader2, ArrowRight } from "lucide-react";
+import { AlertCircle, Loader2, ArrowRight, BookOpen, Info } from "lucide-react";
 
 // ─── TAM Formatter ──────────────────────────────────────────────────
 
-function formatTam(value: number | null | undefined): string {
-  if (value == null) return "—";
-  if (value >= 1_000) {
-    return `$${(value / 1_000).toFixed(1)}T`;
+/**
+ * Parse a TAM value that may be a number (in $B) or a string like "$225B annually".
+ * Returns the numeric value in billions, or null if unparseable.
+ */
+/**
+ * Parse a TAM value that may be:
+ *   - A raw-dollar number (e.g., 9000000000 = $9B)
+ *   - A number already in billions (e.g., 225)
+ *   - A string with suffix (e.g., "$225B", "$2.0T", "$450M")
+ *
+ * Returns the numeric value in billions, or null if unparseable.
+ *
+ * Heuristic for bare numbers: if the value is > 10,000 it's almost certainly
+ * raw dollars, not billions (no single bottleneck has a $10,000B TAM).
+ */
+function parseTam(raw: unknown): number | null {
+  if (raw == null) return null;
+
+  if (typeof raw === "number") {
+    if (isNaN(raw)) return null;
+    // Bare numbers > 10,000 are raw dollars — convert to billions
+    if (raw > 10_000) return raw / 1_000_000_000;
+    return raw;
   }
-  if (value >= 1) {
-    return `$${value.toFixed(1)}B`;
+
+  if (typeof raw !== "string") return null;
+
+  const s = raw.replace(/,/g, "").trim();
+
+  // Match patterns like "$2.0T", "$225B", "$450M", "$12K", or bare numbers with suffix
+  const match = s.match(/([\d.]+)\s*(T|B|M|K)?/i);
+  if (!match) return null;
+
+  const num = parseFloat(match[1]);
+  if (isNaN(num)) return null;
+
+  const suffix = (match[2] || "").toUpperCase();
+  switch (suffix) {
+    case "T": return num * 1_000;   // trillions -> billions
+    case "B": return num;           // already billions
+    case "M": return num / 1_000;   // millions -> billions
+    case "K": return num / 1_000_000;
+    default:
+      // Bare number in a string — apply same heuristic
+      if (num > 10_000) return num / 1_000_000_000;
+      return num;
   }
-  return `$${(value * 1_000).toFixed(0)}M`;
+}
+
+function formatTam(value: unknown): string {
+  const num = parseTam(value);
+  if (num == null) return "—";
+  if (num >= 1_000) {
+    return `$${(num / 1_000).toFixed(1)}T`;
+  }
+  if (num >= 1) {
+    return `$${num.toFixed(1)}B`;
+  }
+  return `$${(num * 1_000).toFixed(0)}M`;
 }
 
 // ─── Number Formatter ───────────────────────────────────────────────
 
-function formatSensitivityValue(value: number | null | undefined): string {
+function formatSensitivityValue(value: unknown): string {
   if (value == null) return "—";
+  // Claude often returns sensitivity values as descriptive strings ("4%", "Severe (-35%)")
+  if (typeof value === "string") return value;
+  if (typeof value !== "number" || isNaN(value)) return "—";
   if (Math.abs(value) >= 1_000_000_000) {
     return `${(value / 1_000_000_000).toFixed(1)}B`;
   }
@@ -94,34 +147,34 @@ function DemandModelCard({ model }: { model: DemandModel }) {
       {/* Scenario columns: Bear / Base / Bull */}
       <div className="grid grid-cols-3 gap-3 mb-5">
         {/* Bear */}
-        <div className="bg-red-500/10 rounded-lg px-3 py-3 text-center">
+        <div className="bg-red-500/10 rounded-lg px-3 py-3 text-center overflow-hidden">
           <p className="text-[11px] font-medium text-red-400 mb-1">Bear Case</p>
           <p className="text-lg font-bold font-mono text-red-400">
             {formatTam(model.bearCase.tam)}
           </p>
-          <p className="text-[10px] text-red-500 mt-0.5 leading-snug">
+          <p className="text-[10px] text-red-500 mt-0.5 leading-snug break-words">
             {model.bearCase.demand}
           </p>
         </div>
 
         {/* Base */}
-        <div className="bg-white/10 rounded-lg px-3 py-3 text-center">
+        <div className="bg-white/10 rounded-lg px-3 py-3 text-center overflow-hidden">
           <p className="text-[11px] font-medium text-text-secondary mb-1">Base Case</p>
           <p className="text-lg font-bold font-mono text-text-primary">
             {formatTam(model.baseCase.tam)}
           </p>
-          <p className="text-[10px] text-text-secondary mt-0.5 leading-snug">
+          <p className="text-[10px] text-text-secondary mt-0.5 leading-snug break-words">
             {model.baseCase.demand}
           </p>
         </div>
 
         {/* Bull */}
-        <div className="bg-emerald-500/10 rounded-lg px-3 py-3 text-center">
+        <div className="bg-emerald-500/10 rounded-lg px-3 py-3 text-center overflow-hidden">
           <p className="text-[11px] font-medium text-emerald-400 mb-1">Bull Case</p>
           <p className="text-lg font-bold font-mono text-emerald-400">
             {formatTam(model.bullCase.tam)}
           </p>
-          <p className="text-[10px] text-emerald-500 mt-0.5 leading-snug">
+          <p className="text-[10px] text-emerald-500 mt-0.5 leading-snug break-words">
             {model.bullCase.demand}
           </p>
         </div>
@@ -153,13 +206,13 @@ function DemandModelCard({ model }: { model: DemandModel }) {
                   >
                     <td className="px-3 py-2 text-xs text-text-primary">{row.variable}</td>
                     <td className="px-3 py-2 text-xs font-mono text-red-400 text-right">
-                      {formatSensitivityValue(row.lowCase)}
+                      {formatSensitivityValue(row.low)}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono text-text-primary text-right">
-                      {formatSensitivityValue(row.baseCase)}
+                      {formatSensitivityValue(row.base)}
                     </td>
                     <td className="px-3 py-2 text-xs font-mono text-emerald-400 text-right">
-                      {formatSensitivityValue(row.highCase)}
+                      {formatSensitivityValue(row.high)}
                     </td>
                     <td className="px-3 py-2 text-xs text-text-secondary text-right">
                       {row.tamImpact}
@@ -174,9 +227,49 @@ function DemandModelCard({ model }: { model: DemandModel }) {
 
       {/* Multiplier Chain */}
       {model.multiplierChain && (
-        <div>
+        <div className="mb-5">
           <p className="text-[11px] font-medium text-text-secondary mb-2">Multiplier Chain</p>
           <MultiplierChain chain={model.multiplierChain} />
+        </div>
+      )}
+
+      {/* Methodology */}
+      {model.methodology && (
+        <div className="mb-5">
+          <div className="flex items-center gap-1.5 mb-2">
+            <Info size={12} className="text-text-tertiary" />
+            <p className="text-[11px] font-medium text-text-secondary">Methodology</p>
+          </div>
+          <p className="text-xs text-text-secondary leading-relaxed">
+            {model.methodology}
+          </p>
+        </div>
+      )}
+
+      {/* Sources */}
+      {model.sources && model.sources.length > 0 ? (
+        <div>
+          <div className="flex items-center gap-1.5 mb-2">
+            <BookOpen size={12} className="text-text-tertiary" />
+            <p className="text-[11px] font-medium text-text-secondary">Sources</p>
+          </div>
+          <ul className="space-y-1">
+            {model.sources.map((source, idx) => (
+              <li key={idx} className="text-xs text-text-secondary leading-relaxed flex items-start gap-1.5">
+                <span className="text-text-tertiary mt-0.5 shrink-0">{idx + 1}.</span>
+                <span>{source}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div className="border-t border-border pt-4">
+          <div className="flex items-center gap-1.5">
+            <Info size={12} className="text-text-tertiary" />
+            <p className="text-[11px] text-text-tertiary italic">
+              Source citations and methodology will appear for newly created screens.
+            </p>
+          </div>
         </div>
       )}
     </div>

@@ -38,6 +38,8 @@ export interface BridgeCandidatesResponse {
   screenId: number;
   certifiedAt: string;
   tier1Count: number;
+  totalCount?: number;
+  tierBreakdown?: { tier1: number; tier2: number; tier3: number };
   candidates: HandoffCandidate[];
 }
 

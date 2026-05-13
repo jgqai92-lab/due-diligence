@@ -166,7 +166,7 @@ function TriggersTable({ triggers }: { triggers: RotationTrigger[] }) {
                   {trigger.action}
                 </td>
                 <td className="px-3 py-2">
-                  <span className="inline-flex items-center px-2 py-0.5 rounded bg-violet-500/10 text-[11px] font-mono text-violet-400">
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-violet-500/10 text-[11px] font-mono text-violet-400 leading-relaxed">
                     {trigger.monitorMetric}
                   </span>
                 </td>

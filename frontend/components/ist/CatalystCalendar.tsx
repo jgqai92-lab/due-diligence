@@ -166,7 +166,7 @@ function CatalystTimelineItem({
           </span>
 
           {/* Pillar */}
-          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-violet-500/10 text-violet-400">
+          <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-medium bg-violet-500/10 text-violet-400">
             {catalyst.pillar}
           </span>
 

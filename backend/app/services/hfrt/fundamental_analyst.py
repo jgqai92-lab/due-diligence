@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field
 
 from app.database import SessionLocal
 from app.models.hfrt import HFRTProject, HFRTTemplate
-from app.services.claude_client import call_claude
+from app.services.claude_client import call_claude, get_step_model_tier
+from app.services.perplexity_client import is_available as perplexity_available, search_and_analyze
 from app.services.workflow_engine import register_step, emit_sse_event
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,9 @@ Analyze the provided company data and produce a comprehensive overview including
 5. Recent developments (last 12 months)
 6. Management team (top 3-5 executives)
 
-NEVER fabricate data. If information is unavailable, say so explicitly.
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate management names, revenue figures, or company history.
+If information is unavailable, return null for that field rather than inventing a value.
 Return ONLY valid JSON matching the schema provided."""
 
 BUSINESS_MODEL_PROMPT = """You are an equity research analyst analyzing a company's business model.
@@ -105,7 +108,9 @@ Based on the provided data, analyze:
 7. Scalability assessment
 8. Recurring revenue percentage estimate
 
-NEVER fabricate financial figures. Use only provided data.
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate financial figures, revenue breakdowns, or customer segment details.
+Return null for any ratio or metric that cannot be calculated from the provided data.
 Return ONLY valid JSON matching the schema provided."""
 
 COMPETITIVE_POSITION_PROMPT = """You are an equity research analyst assessing competitive position.
@@ -130,7 +135,9 @@ SEVEN POWERS (assess presence and strength 0-5):
 
 Also identify: competitive advantages, disadvantages, market share, key competitors.
 
-NEVER fabricate data. Base analysis on provided financial data and public information.
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate competitor names, market share figures, or competitive dynamics not supported by the provided data.
+Do NOT invent peer companies — list only competitors mentioned or implied in the provided context.
 Return ONLY valid JSON matching the schema provided."""
 
 
@@ -231,10 +238,12 @@ async def handle_company_overview(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {CompanyOverviewResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "company_overview")
         result = await call_claude(
             system_prompt=COMPANY_OVERVIEW_PROMPT,
             user_prompt=user_prompt,
             response_model=CompanyOverviewResult,
+            model=model,
         )
 
         _save_template(db, project.id, 1, result.model_dump())
@@ -272,10 +281,12 @@ async def handle_business_model(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {BusinessModelResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "business_model")
         result = await call_claude(
             system_prompt=BUSINESS_MODEL_PROMPT,
             user_prompt=user_prompt,
             response_model=BusinessModelResult,
+            model=model,
         )
 
         _save_template(db, project.id, 2, result.model_dump())
@@ -307,7 +318,34 @@ async def handle_competitive_position(workflow_run_id: int) -> dict | None:
         overview = _get_template_data(db, project.id, 1)
         biz_model = _get_template_data(db, project.id, 2)
 
+        # Optionally enrich with competitor/M&A data from Perplexity
+        competitive_data_block = ""
+        if perplexity_available():
+            try:
+                pplx = await search_and_analyze(
+                    system_prompt=(
+                        "You are a competitive intelligence analyst. Provide recent "
+                        "competitor activity, M&A deals, market share data, and "
+                        "competitive dynamics for the given company and its sector."
+                    ),
+                    user_prompt=(
+                        f"Recent competitor activity, M&A, and market share data "
+                        f"for {project.ticker} ({project.company_name}) in the "
+                        f"{project.sector or 'Unknown'} sector"
+                    ),
+                    model="sonar",
+                    max_tokens=4096,
+                    workflow_run_id=workflow_run_id,
+                )
+                competitive_data_block = (
+                    f"<current_competitive_data>\n{pplx.content}\n</current_competitive_data>\n\n"
+                )
+                logger.info("Perplexity competitive enrichment: %d citations", len(pplx.citations))
+            except Exception:
+                logger.warning("Perplexity competitive enrichment failed, continuing without", exc_info=True)
+
         user_prompt = (
+            f"{competitive_data_block}"
             f"<company_data>\n{json.dumps(company_data, indent=2, default=str)[:12000]}\n</company_data>\n\n"
             f"<company_overview>\n{json.dumps(overview, indent=2, default=str)[:4000]}\n</company_overview>\n\n"
             f"<business_model>\n{json.dumps(biz_model, indent=2, default=str)[:4000]}\n</business_model>\n\n"
@@ -316,10 +354,12 @@ async def handle_competitive_position(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {CompetitivePositionResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "competitive_position")
         result = await call_claude(
             system_prompt=COMPETITIVE_POSITION_PROMPT,
             user_prompt=user_prompt,
             response_model=CompetitivePositionResult,
+            model=model,
         )
 
         _save_template(db, project.id, 3, result.model_dump())

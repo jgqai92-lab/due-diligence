@@ -19,7 +19,7 @@ from app.models.ist import (
     ISTScreen,
     ISTValidation,
 )
-from app.services.ist.claude_client import call_claude
+from app.services.ist.claude_client import call_claude, get_step_model_tier
 from app.services.workflow_engine import emit_sse_event, register_step
 
 logger = logging.getLogger(__name__)
@@ -297,6 +297,7 @@ async def _run_dialectic_optimist(
     *,
     update_screen_status: bool = True,
     replace_artifact: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core optimist dialectic logic."""
     if update_screen_status:
@@ -337,6 +338,7 @@ async def _run_dialectic_optimist(
         system_prompt=OPTIMIST_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=DialecticReviewContent,
+        model=model,
         max_tokens=16384,
     )
 
@@ -371,6 +373,7 @@ async def _run_dialectic_pessimist(
     workflow_run_id: int,
     *,
     replace_artifact: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core pessimist dialectic logic."""
     await emit_sse_event(
@@ -406,6 +409,7 @@ async def _run_dialectic_pessimist(
         system_prompt=PESSIMIST_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=DialecticReviewContent,
+        model=model,
         max_tokens=16384,
     )
 
@@ -440,6 +444,7 @@ async def _run_dialectic_synthesis(
     workflow_run_id: int,
     *,
     replace_artifact: bool = False,
+    model: str | None = None,
 ) -> dict | None:
     """Core synthesis dialectic logic."""
     await emit_sse_event(
@@ -500,6 +505,7 @@ async def _run_dialectic_synthesis(
         system_prompt=SYNTHESIS_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=SynthesisContent,
+        model=model,
         max_tokens=16384,
     )
 
@@ -541,7 +547,8 @@ async def handle_dialectic_optimist(workflow_run_id: int) -> dict | None:
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
 
-        return await _run_dialectic_optimist(screen, db, workflow_run_id)
+        model = await get_step_model_tier(workflow_run_id, "dialectic_optimist")
+        return await _run_dialectic_optimist(screen, db, workflow_run_id, model=model)
     finally:
         db.close()
 
@@ -559,7 +566,8 @@ async def handle_dialectic_pessimist(workflow_run_id: int) -> dict | None:
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
 
-        return await _run_dialectic_pessimist(screen, db, workflow_run_id)
+        model = await get_step_model_tier(workflow_run_id, "dialectic_pessimist")
+        return await _run_dialectic_pessimist(screen, db, workflow_run_id, model=model)
     finally:
         db.close()
 
@@ -577,6 +585,7 @@ async def handle_dialectic_synthesis(workflow_run_id: int) -> dict | None:
         if not screen:
             raise ValueError(f"No IST screen found for workflow {workflow_run_id}")
 
-        return await _run_dialectic_synthesis(screen, db, workflow_run_id)
+        model = await get_step_model_tier(workflow_run_id, "dialectic_synthesis")
+        return await _run_dialectic_synthesis(screen, db, workflow_run_id, model=model)
     finally:
         db.close()

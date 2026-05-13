@@ -4,7 +4,79 @@ import { useState, useEffect } from "react";
 import { cn } from "@/lib/utils";
 import { getDialecticReview } from "@/lib/api/hfrt";
 import type { HFRTDialecticReview } from "@/types/hfrt";
-import { TrendingUp, TrendingDown, AlertCircle, Loader2 } from "lucide-react";
+import { TrendingUp, TrendingDown, AlertCircle, Loader2, ChevronDown, ChevronUp } from "lucide-react";
+
+// ─── Helpers ────────────────────────────────────────────────────────
+
+const LEVEL_ALIASES: Record<string, string> = {
+  HIGH: "HIGH", MEDIUM: "MEDIUM", LOW: "LOW",
+  MODERATE: "MEDIUM", VERY_HIGH: "HIGH", VERY_LOW: "LOW",
+};
+
+function parseConvictionLevel(raw: string): { label: string; summary: string | null } {
+  const match = raw.match(/^(\w[\w\s]*?)\s*[\u2014\u2013\-:]\s+([\s\S]+)/);
+  if (match) {
+    const word = match[1].trim().toUpperCase().replace(/\s+/g, "_");
+    return { label: LEVEL_ALIASES[word] ?? word, summary: match[2].trim() };
+  }
+  const upper = raw.trim().toUpperCase().replace(/\s+/g, "_");
+  return { label: LEVEL_ALIASES[upper] ?? upper, summary: null };
+}
+
+function splitTitleDescription(
+  text: string
+): { title: string; description: string } | null {
+  const match = text.match(/^([A-Z][A-Z0-9\s\-./&,()]+?)[\s]*[\u2014\u2013:]\s+([\s\S]+)/);
+  if (!match) return null;
+  const title = match[1].trim();
+  if (title.length < 3) return null;
+  return { title, description: match[2].trim() };
+}
+
+function CollapsibleItem({
+  text,
+  accentColor,
+  marker,
+}: {
+  text: string;
+  accentColor: string;
+  marker: string;
+}) {
+  const parsed = splitTitleDescription(text);
+  const [open, setOpen] = useState(false);
+
+  if (!parsed) {
+    return (
+      <li className="text-xs text-text-secondary flex items-start gap-1.5">
+        <span className={cn("mt-0.5", accentColor)}>{marker}</span>
+        {text}
+      </li>
+    );
+  }
+
+  return (
+    <li>
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-start gap-1.5 text-left text-xs hover:bg-white/5 rounded py-0.5 transition-colors"
+        aria-expanded={open}
+      >
+        <span className={cn("mt-0.5 flex-shrink-0", accentColor)}>{marker}</span>
+        <span className={cn("font-semibold flex-1 min-w-0", accentColor)}>{parsed.title}</span>
+        {open ? (
+          <ChevronUp size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        ) : (
+          <ChevronDown size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        )}
+      </button>
+      {open && (
+        <div className="ml-4 pl-2 border-l border-border mt-0.5 mb-1">
+          <p className="text-xs text-text-secondary leading-relaxed">{parsed.description}</p>
+        </div>
+      )}
+    </li>
+  );
+}
 
 interface BullBearViewProps {
   projectId: number;
@@ -68,13 +140,25 @@ export default function BullBearView({ projectId }: BullBearViewProps) {
           <h3 className="text-sm font-semibold text-emerald-300">Bull Case</h3>
           {bull?.content?.convictionLevel && (
             <span className="ml-auto text-xs font-medium text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full">
-              {bull.content.convictionLevel}
+              {parseConvictionLevel(bull.content.convictionLevel).label}
             </span>
           )}
         </div>
         <div className="p-5 space-y-4">
           {bull?.content ? (
             <>
+              {/* Conviction Summary */}
+              {bull.content.convictionLevel && (() => {
+                const { summary } = parseConvictionLevel(bull.content.convictionLevel);
+                if (!summary) return null;
+                return (
+                  <div className="p-3 rounded-lg border bg-emerald-500/10 border-emerald-500/30">
+                    <p className="text-[11px] font-medium text-text-secondary mb-1">Summary</p>
+                    <p className="text-xs text-text-primary leading-relaxed">{summary}</p>
+                  </div>
+                );
+              })()}
+
               <p className="text-sm text-text-primary leading-relaxed">{bull.content.narrative}</p>
 
               {bull.content.keyArguments?.length > 0 && (
@@ -82,10 +166,7 @@ export default function BullBearView({ projectId }: BullBearViewProps) {
                   <h4 className="text-xs font-semibold text-text-secondary uppercase mb-2">Key Arguments</h4>
                   <ul className="space-y-1">
                     {bull.content.keyArguments.map((arg, i) => (
-                      <li key={i} className="text-xs text-text-secondary flex items-start gap-1.5">
-                        <span className="text-emerald-500 mt-0.5">+</span>
-                        {arg}
-                      </li>
+                      <CollapsibleItem key={i} text={arg} accentColor="text-emerald-500" marker="+" />
                     ))}
                   </ul>
                 </div>
@@ -124,13 +205,25 @@ export default function BullBearView({ projectId }: BullBearViewProps) {
           <h3 className="text-sm font-semibold text-red-300">Bear Case</h3>
           {bear?.content?.convictionLevel && (
             <span className="ml-auto text-xs font-medium text-red-400 bg-red-500/10 px-2 py-0.5 rounded-full">
-              {bear.content.convictionLevel}
+              {parseConvictionLevel(bear.content.convictionLevel).label}
             </span>
           )}
         </div>
         <div className="p-5 space-y-4">
           {bear?.content ? (
             <>
+              {/* Conviction Summary */}
+              {bear.content.convictionLevel && (() => {
+                const { summary } = parseConvictionLevel(bear.content.convictionLevel);
+                if (!summary) return null;
+                return (
+                  <div className="p-3 rounded-lg border bg-red-500/10 border-red-500/30">
+                    <p className="text-[11px] font-medium text-text-secondary mb-1">Summary</p>
+                    <p className="text-xs text-text-primary leading-relaxed">{summary}</p>
+                  </div>
+                );
+              })()}
+
               <p className="text-sm text-text-primary leading-relaxed">{bear.content.narrative}</p>
 
               {bear.content.keyArguments?.length > 0 && (
@@ -138,10 +231,7 @@ export default function BullBearView({ projectId }: BullBearViewProps) {
                   <h4 className="text-xs font-semibold text-text-secondary uppercase mb-2">Key Arguments</h4>
                   <ul className="space-y-1">
                     {bear.content.keyArguments.map((arg, i) => (
-                      <li key={i} className="text-xs text-text-secondary flex items-start gap-1.5">
-                        <span className="text-red-500 mt-0.5">-</span>
-                        {arg}
-                      </li>
+                      <CollapsibleItem key={i} text={arg} accentColor="text-red-500" marker="-" />
                     ))}
                   </ul>
                 </div>
@@ -152,7 +242,7 @@ export default function BullBearView({ projectId }: BullBearViewProps) {
                   <h4 className="text-xs font-semibold text-text-secondary uppercase mb-2">Key Risks</h4>
                   <ul className="space-y-1">
                     {bear.content.risks.map((risk, i) => (
-                      <li key={i} className="text-xs text-text-secondary">{risk}</li>
+                      <CollapsibleItem key={i} text={risk} accentColor="text-red-500" marker="-" />
                     ))}
                   </ul>
                 </div>

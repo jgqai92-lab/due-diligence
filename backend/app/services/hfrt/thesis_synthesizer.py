@@ -20,7 +20,8 @@ from pydantic import BaseModel, Field
 
 from app.database import SessionLocal
 from app.models.hfrt import HFRTProject, HFRTTemplate, HFRTDialecticReview
-from app.services.claude_client import call_claude, call_claude_raw
+from app.services.claude_client import call_claude, call_claude_raw, get_step_model_tier
+from app.services.perplexity_client import is_available as perplexity_available, search_and_analyze
 from app.services.workflow_engine import register_step, emit_sse_event
 
 logger = logging.getLogger(__name__)
@@ -101,7 +102,11 @@ Analyze the research data to identify:
 5. Timeline visualization
 
 For each catalyst, provide date/timeframe, description, probability, and expected impact.
-NEVER fabricate dates or events. Return ONLY valid JSON matching the schema."""
+
+Every data point MUST come from the provided templates in XML tags above.
+NEVER fabricate catalysts, timeline estimates, or probability figures not grounded in the provided data.
+Do NOT invent specific earnings dates or event dates unless explicitly mentioned in the provided data.
+Return ONLY valid JSON matching the schema."""
 
 THESIS_PROMPT = """You are a senior equity research analyst writing an investment thesis.
 
@@ -119,7 +124,10 @@ Recommend: BUY (>0.7), HOLD (0.4-0.7), SELL (<0.4 with deterioration), PASS (<0.
 Position: FULL (>0.8), HALF (0.6-0.8), QUARTER (0.4-0.6), WATCH (<0.4)
 
 Include thesis kill conditions — specific events that would invalidate the thesis.
-NEVER fabricate data. Return ONLY valid JSON matching the schema."""
+
+Every data point MUST come from the provided templates in XML tags above.
+NEVER fabricate price targets, conviction factors, or kill conditions not grounded in the provided data.
+Return ONLY valid JSON matching the schema."""
 
 SYNTHESIS_PROMPT = """You are a synthesis analyst combining multiple perspectives into a coherent narrative.
 
@@ -128,6 +136,8 @@ Review the provided case and research data, then produce:
 2. Key points extracted
 3. Resolution of any tensions or contradictions
 
+Every data point MUST come from the provided templates in XML tags above.
+NEVER fabricate synthesis conclusions, price targets, or investment arguments not grounded in the provided case data.
 Return ONLY valid JSON matching the schema."""
 
 MEMO_PROMPT = """You are a senior equity research analyst writing the FINAL investment memo.
@@ -147,7 +157,10 @@ This memo synthesizes ALL research into a single deliverable. Structure:
 11. KEY MONITORING METRICS
 
 Write in clear, professional prose. Include specific data points with citations.
-NEVER fabricate data. Use only data from the provided templates."""
+
+Every data point MUST come from the provided templates in XML tags above.
+NEVER fabricate financial figures, price targets, executive names, or investment conclusions not present in the provided templates.
+Return ONLY the memo text with no additional commentary."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -193,13 +206,75 @@ def _get_dialectic(db, project_id: int, side: str) -> dict | None:
 
 
 def _gather_all_templates(db, project_id: int, max_chars_per: int = 3000) -> str:
-    """Gather all populated templates as context."""
+    """Gather all populated templates as context (Gap 4: + SEC filing sections + yfinance snapshot)."""
     parts = []
+
+    # Templates 00-14
     for num in range(15):
         data = _get_template_data(db, project_id, num)
         if data:
             data_str = json.dumps(data, indent=2, default=str)[:max_chars_per]
             parts.append(f"<template_{num:02d}>\n{data_str}\n</template_{num:02d}>")
+
+    # SEC filing key sections (Gap 4)
+    try:
+        from app.models.hfrt import HFRTProject, HFRTSECFiling
+        from app.services.hfrt.edgar_service import extract_filing_sections
+
+        project = db.query(HFRTProject).filter(HFRTProject.id == project_id).first()
+        if project:
+            sec_parts = []
+            for filing_type in ("10-K", "10-Q", "DEF 14A"):
+                filing = (
+                    db.query(HFRTSECFiling)
+                    .filter(
+                        HFRTSECFiling.project_id == project_id,
+                        HFRTSECFiling.filing_type == filing_type,
+                    )
+                    .order_by(HFRTSECFiling.fetched_at.desc())
+                    .first()
+                )
+                if filing and filing.content:
+                    sections = extract_filing_sections(filing.content)
+                    for section_key in ("business", "risk_factors", "md_and_a"):
+                        section_text = sections.get(section_key, "")
+                        if section_text:
+                            sec_parts.append(
+                                f"<{section_key} filing_type=\"{filing_type}\">\n"
+                                f"{section_text[:2000]}\n"
+                                f"</{section_key}>"
+                            )
+            if sec_parts:
+                parts.append(
+                    "<sec_filing>\n" + "\n\n".join(sec_parts) + "\n</sec_filing>"
+                )
+    except Exception as exc:
+        logger.warning("Gap 4: SEC filing section enrichment failed: %s", exc)
+
+    # yfinance snapshot (Gap 4)
+    try:
+        from app.models.hfrt import HFRTProject
+        from app.services.hfrt.data_cache import get_yfinance_info
+
+        project = db.query(HFRTProject).filter(HFRTProject.id == project_id).first()
+        if project:
+            info = get_yfinance_info(project.ticker)
+            snapshot_keys = (
+                "marketCap", "trailingPE", "forwardPE", "priceToBook",
+                "enterpriseToEbitda", "beta", "dividendYield",
+                "totalRevenue", "ebitda", "freeCashflow",
+                "totalDebt", "totalCash", "currentPrice",
+            )
+            snapshot = {k: info.get(k) for k in snapshot_keys if info.get(k) is not None}
+            if snapshot:
+                parts.append(
+                    f"<yfinance_snapshot>\n"
+                    f"{json.dumps(snapshot, indent=2, default=str)}\n"
+                    f"</yfinance_snapshot>"
+                )
+    except Exception as exc:
+        logger.warning("Gap 4: yfinance snapshot enrichment failed: %s", exc)
+
     return "\n\n".join(parts)
 
 
@@ -231,7 +306,34 @@ async def handle_catalyst_analysis(workflow_run_id: int) -> dict | None:
         bull = _get_dialectic(db, project.id, "BULL")
         bear = _get_dialectic(db, project.id, "BEAR")
 
+        # Optionally enrich with real upcoming events from Perplexity
+        catalyst_data_block = ""
+        if perplexity_available():
+            try:
+                pplx = await search_and_analyze(
+                    system_prompt=(
+                        "You are a financial events researcher. Find upcoming "
+                        "earnings dates, product launches, regulatory decisions, "
+                        "analyst days, and other material events for this company. "
+                        "Provide specific dates where available."
+                    ),
+                    user_prompt=(
+                        f"Upcoming catalysts and events for "
+                        f"{project.ticker} ({project.company_name})"
+                    ),
+                    model="sonar",
+                    max_tokens=4096,
+                    workflow_run_id=workflow_run_id,
+                )
+                catalyst_data_block = (
+                    f"<verified_upcoming_events>\n{pplx.content}\n</verified_upcoming_events>\n\n"
+                )
+                logger.info("Perplexity catalyst enrichment: %d citations", len(pplx.citations))
+            except Exception:
+                logger.warning("Perplexity catalyst enrichment failed, continuing without", exc_info=True)
+
         user_prompt = (
+            f"{catalyst_data_block}"
             f"<research_data>\n{context}\n</research_data>\n\n"
             f"<bull_case>\n{json.dumps(bull, indent=2, default=str)[:3000]}\n</bull_case>\n\n"
             f"<bear_case>\n{json.dumps(bear, indent=2, default=str)[:3000]}\n</bear_case>\n\n"
@@ -239,10 +341,12 @@ async def handle_catalyst_analysis(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {CatalystAnalysisResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "catalyst_analysis")
         result = await call_claude(
             system_prompt=CATALYST_PROMPT,
             user_prompt=user_prompt,
             response_model=CatalystAnalysisResult,
+            model=model,
         )
 
         _save_template(db, project.id, 10, result.model_dump())
@@ -281,10 +385,12 @@ async def handle_investment_thesis(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {InvestmentThesisResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "investment_thesis")
         result = await call_claude(
             system_prompt=THESIS_PROMPT,
             user_prompt=user_prompt,
             response_model=InvestmentThesisResult,
+            model=model,
         )
 
         # Update project with thesis results
@@ -330,10 +436,12 @@ async def handle_bull_synthesis(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {SynthesisResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "bull_synthesis")
         result = await call_claude(
             system_prompt=SYNTHESIS_PROMPT,
             user_prompt=user_prompt,
             response_model=SynthesisResult,
+            model=model,
         )
 
         _save_template(db, project.id, 12, result.model_dump())
@@ -366,10 +474,12 @@ async def handle_bear_synthesis(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {SynthesisResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "bear_synthesis")
         result = await call_claude(
             system_prompt=SYNTHESIS_PROMPT,
             user_prompt=user_prompt,
             response_model=SynthesisResult,
+            model=model,
         )
 
         _save_template(db, project.id, 13, result.model_dump())
@@ -381,7 +491,7 @@ async def handle_bear_synthesis(workflow_run_id: int) -> dict | None:
 
 @register_step("HFRT", "thesis_coherence_gate")
 async def handle_thesis_coherence_gate(workflow_run_id: int) -> dict | None:
-    """Validate bull/bear synthesis balance."""
+    """Validate bull/bear synthesis balance (Gap 5: server-side pre-checks + Claude balance check)."""
     db = SessionLocal()
     try:
         project = (
@@ -396,6 +506,61 @@ async def handle_thesis_coherence_gate(workflow_run_id: int) -> dict | None:
         bear_syn = _get_template_data(db, project.id, 13)
         thesis = _get_template_data(db, project.id, 11)
 
+        # Gap 5: Server-side pre-checks BEFORE the Claude call
+        server_deficiencies: list[str] = []
+
+        # 1. Bull/bear syntheses both exist with non-empty narratives
+        if not bull_syn or not bull_syn.get("narrative", "").strip():
+            server_deficiencies.append("Bull synthesis is missing or has an empty narrative")
+        if not bear_syn or not bear_syn.get("narrative", "").strip():
+            server_deficiencies.append("Bear synthesis is missing or has an empty narrative")
+
+        # 2. Conviction score in valid range [0, 1]
+        conviction = (thesis or {}).get("overall_conviction_score")
+        if conviction is None:
+            server_deficiencies.append("Investment thesis is missing overall_conviction_score")
+        elif not (0.0 <= float(conviction) <= 1.0):
+            server_deficiencies.append(
+                f"Conviction score {conviction} is out of valid range [0, 1]"
+            )
+
+        # 3. At least 2 kill conditions defined
+        kill_conditions = (thesis or {}).get("thesis_kill_conditions", [])
+        if len(kill_conditions) < 2:
+            server_deficiencies.append(
+                f"Only {len(kill_conditions)} kill condition(s) defined; at least 2 required"
+            )
+
+        # 4. Valid recommendation
+        recommendation = (thesis or {}).get("recommendation", "")
+        if recommendation not in ("BUY", "HOLD", "SELL", "PASS"):
+            server_deficiencies.append(
+                f"Invalid recommendation '{recommendation}'; must be BUY, HOLD, SELL, or PASS"
+            )
+
+        # 5. Key templates (01, 05, 06, 08) are populated
+        required_templates = {1: "Company Overview", 5: "Financial Analysis", 6: "Valuation", 8: "Risk Analysis"}
+        for tpl_num, tpl_name in required_templates.items():
+            tpl_data = _get_template_data(db, project.id, tpl_num)
+            if not tpl_data:
+                server_deficiencies.append(f"Template {tpl_num:02d} ({tpl_name}) is not populated")
+
+        # If server pre-checks catch hard failures, skip Claude call and fail immediately
+        if server_deficiencies:
+            all_deficiencies = server_deficiencies
+            await emit_sse_event(workflow_run_id, "gate_failed", {
+                "gateName": "thesis_coherence_gate",
+                "deficiencies": all_deficiencies,
+                "source": "server_pre_check",
+            })
+            return {
+                "gate": "thesis_coherence",
+                "passes": False,
+                "deficiencies": all_deficiencies,
+                "source": "server_pre_check",
+            }
+
+        # Server pre-checks passed — run Claude balance assessment
         user_prompt = (
             f"<bull_synthesis>\n{json.dumps(bull_syn, indent=2, default=str)[:4000]}\n</bull_synthesis>\n\n"
             f"<bear_synthesis>\n{json.dumps(bear_syn, indent=2, default=str)[:4000]}\n</bear_synthesis>\n\n"
@@ -404,19 +569,30 @@ async def handle_thesis_coherence_gate(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {CoherenceResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "thesis_coherence_gate")
         result = await call_claude(
             system_prompt="You are a quality assurance analyst checking thesis coherence. Return ONLY valid JSON.",
             user_prompt=user_prompt,
             response_model=CoherenceResult,
+            model=model,
         )
 
-        if not result.passes:
+        # Gap 5: Merge server-side deficiencies (empty here) with Claude's findings
+        # Gate fails if EITHER set has issues
+        all_deficiencies = server_deficiencies + result.deficiencies
+        passes = len(all_deficiencies) == 0
+
+        if not passes:
             await emit_sse_event(workflow_run_id, "gate_failed", {
                 "gateName": "thesis_coherence_gate",
-                "deficiencies": result.deficiencies,
+                "deficiencies": all_deficiencies,
             })
 
-        return {"gate": "thesis_coherence", "passes": result.passes}
+        return {
+            "gate": "thesis_coherence",
+            "passes": passes,
+            "deficiencies": all_deficiencies,
+        }
     finally:
         db.close()
 
@@ -453,9 +629,11 @@ async def handle_investment_memo(workflow_run_id: int) -> dict | None:
             f"Key Monitoring Metrics."
         )
 
+        model = await get_step_model_tier(workflow_run_id, "investment_memo")
         memo_content = await call_claude_raw(
             system_prompt=MEMO_PROMPT,
             user_prompt=user_prompt,
+            model=model,
             max_tokens=16384,
         )
 

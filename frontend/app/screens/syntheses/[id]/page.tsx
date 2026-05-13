@@ -107,7 +107,7 @@ export default function SynthesisDetailPage() {
       .catch(() => setDialecticContent(null));
   }, [synthesis, dialecticSide]);
 
-  const { workflowStatus: sseStatus, steps: sseSteps } = useWorkflowSSE({
+  const { workflowStatus: sseStatus, steps: sseSteps, reconnect: reconnectSSE } = useWorkflowSSE({
     workflowId: synthesis?.workflowRunId ?? null,
     onWorkflowComplete: refresh,
     onCheckpoint: refresh,
@@ -149,6 +149,7 @@ export default function SynthesisDetailPage() {
     if (!runId) return;
     await retryWorkflow(runId);
     await refresh();
+    reconnectSSE();
   };
   const onToggleAutoAdvance = async (enabled: boolean) => {
     if (!runId) return;
@@ -225,7 +226,7 @@ export default function SynthesisDetailPage() {
       </div>
 
       {tab === "report" && (
-        <SynthesisReport report={synthesis.report} metadata={synthesis.reportMetadata} />
+        <SynthesisReport report={synthesis.report} metadata={synthesis.reportMetadata} synthesisName={synthesis.name} />
       )}
       {tab === "overlap" && (
         <OverlapMatrix entries={synthesis.overlapMatrix ?? []} />

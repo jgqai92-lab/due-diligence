@@ -168,12 +168,14 @@ export interface DemandModel {
   bearCase: { demand: string; tam: number };
   sensitivityTable: Array<{
     variable: string;
-    lowCase: number;
-    baseCase: number;
-    highCase: number;
+    low: unknown;
+    base: unknown;
+    high: unknown;
     tamImpact: string;
   }>;
   multiplierChain: string | null;
+  methodology: string | null;
+  sources: string[];
 }
 
 export interface DemandModelsResponse {
@@ -541,6 +543,8 @@ export interface HandoffData {
   screenId: number;
   certifiedAt: string | null;
   tier1Count: number;
+  totalCount?: number;
+  tierBreakdown?: { tier1: number; tier2: number; tier3: number };
   candidates: HandoffCandidate[];
 }
 
@@ -550,5 +554,31 @@ export interface HandoffResponse {
   certified: boolean;
   certifiedAt: string | null;
   tier1Count: number;
+  totalCount?: number;
+  tierBreakdown?: { tier1: number; tier2: number; tier3: number };
   candidates: HandoffCandidate[];
+}
+
+// ─── Watchlist (Cross-Screen) ────────────────────────────────────────
+
+export interface WatchlistCandidate {
+  id: number;
+  ticker: string;
+  companyName: string;
+  tier: 1 | 2 | 3;
+  conviction: "HIGH" | "MEDIUM" | "LOW";
+  scarcityScore: ScarcityScore | null;
+  catalyst: string | null;
+  bottleneckName: string;
+  screenId: number;
+  screenName: string;
+  screenDate: string | null;
+  appearsInScreens: number;
+}
+
+export interface WatchlistResponse {
+  candidates: WatchlistCandidate[];
+  total: number;
+  tierBreakdown: { tier1: number; tier2: number; tier3: number };
+  multiScreenTickers: Array<{ ticker: string; screenCount: number }>;
 }

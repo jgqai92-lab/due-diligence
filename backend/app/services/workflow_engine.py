@@ -25,6 +25,7 @@ from app.services.claude_client import (
     clear_workflow_context,
     TokenBudgetExceededError,
 )
+from app.services.perplexity_client import clear_workflow_perplexity_usage
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,16 @@ def get_active_workflow_count() -> int:
     return len(_active_workflows)
 
 
+def is_workflow_orphaned(workflow_id: int) -> bool:
+    """Check if a workflow is orphaned (DB says RUNNING but no asyncio task exists).
+
+    This happens when the server restarts while a workflow step is executing:
+    the in-memory _active_workflows dict is cleared, but the DB rows still
+    show status=RUNNING.
+    """
+    return workflow_id not in _active_workflows
+
+
 async def start_workflow(workflow_id: int):
     """Start executing a workflow in a background asyncio task.
 
@@ -179,7 +190,37 @@ async def retry_workflow(workflow_id: int):
         run = db.query(WorkflowRun).filter(WorkflowRun.id == workflow_id).first()
         if not run:
             raise ValueError(f"Workflow {workflow_id} not found")
-        if run.status != "FAILED":
+
+        if run.status == "RUNNING":
+            if not is_workflow_orphaned(workflow_id):
+                raise ValueError(
+                    "Workflow is actively running. "
+                    "Pause or cancel it before retrying."
+                )
+            # Recover orphaned workflow: mark RUNNING steps as FAILED
+            orphaned_steps = (
+                db.query(WorkflowStep)
+                .filter(WorkflowStep.workflow_run_id == workflow_id)
+                .filter(WorkflowStep.status == "RUNNING")
+                .all()
+            )
+            now = datetime.now(timezone.utc)
+            for step in orphaned_steps:
+                step.status = "FAILED"
+                step.error_message = (
+                    "Recovered from orphaned state (server restart)"
+                )
+                step.completed_at = now
+                if step.started_at:
+                    delta = now - _ensure_utc(step.started_at)
+                    step.duration_ms = int(delta.total_seconds() * 1000)
+            run.status = "FAILED"
+            db.commit()
+            logger.info(
+                "Workflow %d: recovered %d orphaned RUNNING step(s)",
+                workflow_id, len(orphaned_steps),
+            )
+        elif run.status != "FAILED":
             raise ValueError(
                 f"Cannot retry workflow in {run.status} state. "
                 "Only FAILED workflows can be retried."
@@ -722,6 +763,7 @@ async def _run_workflow(workflow_id: int):
             )
     finally:
         clear_workflow_context(workflow_id)
+        clear_workflow_perplexity_usage(workflow_id)
         db.close()
 
 

@@ -17,7 +17,8 @@ from pydantic import BaseModel, Field
 
 from app.database import SessionLocal
 from app.models.hfrt import HFRTProject, HFRTTemplate
-from app.services.claude_client import call_claude
+from app.services.claude_client import call_claude, get_step_model_tier
+from app.services.perplexity_client import is_available as perplexity_available, search_and_analyze
 from app.services.workflow_engine import register_step, emit_sse_event
 
 logger = logging.getLogger(__name__)
@@ -108,8 +109,10 @@ Analyze the provided financial data to produce:
 
 5. KEY TRENDS and RED FLAGS
 
-Calculate from actual data where possible. NEVER fabricate financial figures.
-If data is insufficient for a calculation, return null.
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate financial figures, ratios, or growth rates.
+Return null if a ratio cannot be calculated from the provided data — do NOT estimate or invent values.
+Do NOT invent peer companies or fabricate industry benchmark comparisons.
 Return ONLY valid JSON matching the schema provided."""
 
 VALUATION_PROMPT = """You are a quantitative equity research analyst performing valuation analysis.
@@ -135,7 +138,10 @@ Build a comprehensive valuation including:
 
 5. FAIR VALUE RANGE: bull/base/bear scenarios
 
-Use provided financial data. NEVER fabricate numbers.
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate financial figures, peer multiples, or price targets.
+Return null if a ratio cannot be calculated from the provided data — do NOT estimate or invent values.
+Do NOT invent peer companies or fabricate peer comparison data not present in the provided context.
 Return ONLY valid JSON matching the schema provided."""
 
 SUFFICIENCY_PROMPT = """You are a research quality gate checking whether Templates 01-06 are sufficiently complete.
@@ -230,10 +236,12 @@ async def handle_financial_analysis(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {FinancialAnalysisResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "financial_analysis")
         result = await call_claude(
             system_prompt=FINANCIAL_ANALYSIS_PROMPT,
             user_prompt=user_prompt,
             response_model=FinancialAnalysisResult,
+            model=model,
         )
 
         _save_template(db, project.id, 5, result.model_dump())
@@ -265,7 +273,34 @@ async def handle_valuation(workflow_run_id: int) -> dict | None:
         financials = _get_template_data(db, project.id, 5)
         industry = _get_template_data(db, project.id, 4)
 
+        # Optionally enrich with current market rates and peer multiples
+        valuation_data_block = ""
+        if perplexity_available():
+            try:
+                pplx = await search_and_analyze(
+                    system_prompt=(
+                        "You are a valuation analyst. Provide current market rates "
+                        "and comparable company valuation multiples for the given stock."
+                    ),
+                    user_prompt=(
+                        f"Current risk-free rate (10Y Treasury), equity risk premium, "
+                        f"and comparable peer valuation multiples (P/E, EV/EBITDA, P/S) "
+                        f"for {project.ticker} ({project.company_name}) in the "
+                        f"{project.sector or 'Unknown'} sector"
+                    ),
+                    model="sonar",
+                    max_tokens=4096,
+                    workflow_run_id=workflow_run_id,
+                )
+                valuation_data_block = (
+                    f"<current_valuation_data>\n{pplx.content}\n</current_valuation_data>\n\n"
+                )
+                logger.info("Perplexity valuation enrichment: %d citations", len(pplx.citations))
+            except Exception:
+                logger.warning("Perplexity valuation enrichment failed, continuing without", exc_info=True)
+
         user_prompt = (
+            f"{valuation_data_block}"
             f"<financial_data>\n{json.dumps(financial_data, indent=2, default=str)[:15000]}\n</financial_data>\n\n"
             f"<financial_analysis>\n{json.dumps(financials, indent=2, default=str)[:5000]}\n</financial_analysis>\n\n"
             f"<industry_analysis>\n{json.dumps(industry, indent=2, default=str)[:3000]}\n</industry_analysis>\n\n"
@@ -273,10 +308,12 @@ async def handle_valuation(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {ValuationResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "valuation")
         result = await call_claude(
             system_prompt=VALUATION_PROMPT,
             user_prompt=user_prompt,
             response_model=ValuationResult,
+            model=model,
             max_tokens=12288,
         )
 
@@ -320,10 +357,12 @@ async def handle_research_sufficiency_gate(workflow_run_id: int) -> dict | None:
             f"Return JSON matching this schema: {SufficiencyResult.model_json_schema()}"
         )
 
+        model = await get_step_model_tier(workflow_run_id, "research_sufficiency_gate")
         result = await call_claude(
             system_prompt=SUFFICIENCY_PROMPT,
             user_prompt=user_prompt,
             response_model=SufficiencyResult,
+            model=model,
         )
 
         if not result.passes:

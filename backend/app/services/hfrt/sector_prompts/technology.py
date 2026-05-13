@@ -17,7 +17,9 @@ Analyze the industry for the given company with deep sector expertise:
 11. **Key players**: Market share data, competitive positioning map
 12. **M&A activity**: Consolidation trends, strategic vs financial buyers
 
-NEVER fabricate data. Cite sources where possible. Return ONLY valid JSON matching the schema."""
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate market size figures, competitor data, or KPI benchmarks not present in the provided context.
+Return ONLY valid JSON matching the schema."""
 
 KPIS = [
     "ARR / Annual Recurring Revenue",

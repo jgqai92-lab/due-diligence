@@ -17,7 +17,9 @@ Analyze the industry for the given company with deep sector expertise:
 11. **International exposure**: Geographic mix, emerging market growth, currency risk
 12. **ESG/Sustainability**: Supply chain transparency, sustainability initiatives, consumer preferences
 
-NEVER fabricate data. Cite sources where possible. Return ONLY valid JSON matching the schema."""
+Use ONLY data provided in the XML-wrapped context above.
+NEVER fabricate comparable sales figures, market share data, or unit economics not present in the provided context.
+Return ONLY valid JSON matching the schema."""
 
 KPIS = [
     "Comparable / Same-store sales growth",

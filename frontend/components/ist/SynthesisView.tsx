@@ -20,7 +20,63 @@ import {
   Minus,
 } from "lucide-react";
 
-// ─── Conviction Badge ──────────────────────────────────────────────
+// ─── Title/Description Splitter ─────────────────────────────────────
+
+function splitTitleDescription(
+  text: string
+): { title: string; description: string } | null {
+  // Match "ALL CAPS TITLE: explanation" or "ALL CAPS TITLE — explanation"
+  const match = text.match(/^([A-Z][A-Z0-9\s\-./&,()]+?)[\s]*[\u2014\u2013:]\s+([\s\S]+)/);
+  if (!match) return null;
+  const title = match[1].trim();
+  if (title.length < 3) return null;
+  return { title, description: match[2].trim() };
+}
+
+// ─── Collapsible Risk ───────────────────────────────────────────────
+
+function CollapsibleRisk({
+  title,
+  description,
+}: {
+  title: string;
+  description: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div role="listitem">
+      <button
+        onClick={() => setOpen(!open)}
+        className={cn(
+          "w-full flex items-start gap-2 py-1 text-left",
+          "hover:bg-white/5 rounded transition-colors duration-100",
+          "focus:outline-none focus:ring-1 focus:ring-primary rounded"
+        )}
+        aria-expanded={open}
+      >
+        <AlertTriangle size={12} className="flex-shrink-0 text-amber-400 mt-0.5" aria-hidden="true" />
+        <span className="text-xs font-semibold text-amber-400 leading-snug flex-1 min-w-0">
+          {title}
+        </span>
+        {open ? (
+          <ChevronUp size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        ) : (
+          <ChevronDown size={12} className="text-text-tertiary flex-shrink-0 mt-0.5" />
+        )}
+      </button>
+      {open && (
+        <div className="ml-3.5 pl-2 border-l border-amber-500/30 mt-0.5 mb-1">
+          <p className="text-xs text-amber-400/80 leading-relaxed">
+            {description}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Conviction Level Parser ────────────────────────────────────────
 
 const CONVICTION_COLORS: Record<string, { bg: string; text: string }> = {
   HIGH:   { bg: "bg-emerald-500/10", text: "text-emerald-400" },
@@ -28,9 +84,26 @@ const CONVICTION_COLORS: Record<string, { bg: string; text: string }> = {
   LOW:    { bg: "bg-white/10", text: "text-text-secondary" },
 };
 
+const LEVEL_ALIASES: Record<string, string> = {
+  HIGH: "HIGH", MEDIUM: "MEDIUM", LOW: "LOW",
+  MODERATE: "MEDIUM", VERY_HIGH: "HIGH", VERY_LOW: "LOW",
+};
+
+function parseConvictionLevel(raw: string): { label: string; summary: string | null } {
+  const match = raw.match(/^(\w[\w\s]*?)\s*[\u2014\u2013\-:]\s+([\s\S]+)/);
+  if (match) {
+    const word = match[1].trim().toUpperCase().replace(/\s+/g, "_");
+    const label = LEVEL_ALIASES[word] ?? word;
+    return { label, summary: match[2].trim() };
+  }
+  const upper = raw.trim().toUpperCase().replace(/\s+/g, "_");
+  const label = LEVEL_ALIASES[upper] ?? upper;
+  return { label, summary: null };
+}
+
 function ConvictionBadge({ level }: { level: string }) {
-  const upper = level.toUpperCase();
-  const config = CONVICTION_COLORS[upper] ?? CONVICTION_COLORS.LOW;
+  const { label } = parseConvictionLevel(level);
+  const config = CONVICTION_COLORS[label] ?? CONVICTION_COLORS.LOW;
   return (
     <span
       className={cn(
@@ -39,7 +112,7 @@ function ConvictionBadge({ level }: { level: string }) {
         config.text
       )}
     >
-      {level}
+      {label}
     </span>
   );
 }
@@ -107,7 +180,7 @@ function TierAdjustmentTable({ adjustments }: { adjustments: TierAdjustment[] })
                     )}
                   </span>
                 </td>
-                <td className="px-3 py-2 text-[11px] text-text-secondary leading-relaxed max-w-[300px]">
+                <td className="px-3 py-2 text-[11px] text-text-secondary leading-relaxed">
                   {adj.rationale}
                 </td>
               </tr>
@@ -317,21 +390,39 @@ export default function SynthesisView({ screenId }: SynthesisViewProps) {
         <ConvictionBadge level={syn.overallConviction} />
       </div>
 
-      {/* Key Risks as pill badges */}
+      {/* Conviction Summary */}
+      {(() => {
+        const { summary } = parseConvictionLevel(syn.overallConviction);
+        if (!summary) return null;
+        return (
+          <div className="mb-5 p-3 rounded-lg border bg-violet-500/10 border-violet-500/30">
+            <p className="text-[11px] font-medium text-text-secondary mb-1">Summary</p>
+            <p className="text-xs text-text-primary leading-relaxed">{summary}</p>
+          </div>
+        );
+      })()}
+
+      {/* Key Risks */}
       {syn.keyRisks.length > 0 && (
         <div className="mb-5">
-          <p className="text-[11px] font-medium text-text-secondary mb-2">Key Risks</p>
-          <div className="flex flex-wrap gap-1.5" role="list" aria-label="Key risks">
-            {syn.keyRisks.map((risk, idx) => (
-              <span
-                key={idx}
-                role="listitem"
-                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30"
-              >
-                <AlertTriangle size={10} className="flex-shrink-0" aria-hidden="true" />
-                {risk}
-              </span>
-            ))}
+          <p className="text-[11px] font-medium text-text-secondary mb-2">
+            Key Risks ({syn.keyRisks.length})
+          </p>
+          <div className="space-y-1" role="list" aria-label="Key risks">
+            {syn.keyRisks.map((risk, idx) => {
+              const parsed = splitTitleDescription(risk);
+              if (!parsed) {
+                return (
+                  <div key={idx} role="listitem" className="flex items-start gap-2 py-1">
+                    <AlertTriangle size={12} className="flex-shrink-0 text-amber-400 mt-0.5" aria-hidden="true" />
+                    <span className="text-xs text-amber-400 leading-relaxed">
+                      {risk}
+                    </span>
+                  </div>
+                );
+              }
+              return <CollapsibleRisk key={idx} title={parsed.title} description={parsed.description} />;
+            })}
           </div>
         </div>
       )}

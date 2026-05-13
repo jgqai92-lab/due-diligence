@@ -37,16 +37,18 @@ limiter = Limiter(key_func=get_remote_address)
 router = APIRouter(prefix="/api/hfrt", tags=["hfrt"])
 
 
-# ── HFRT workflow step definitions (23 steps across 5 phases) ────────────────
+# ── HFRT workflow step definitions (24 steps across 5 phases) ────────────────
+# Gap 1: external_validation inserted at step_order 14 (after dd_sufficiency_gate).
+# All subsequent steps bumped by 1 (total 23 → 24 steps).
 
 HFRT_WORKFLOW_STEPS = [
     # Phase 1: Screening
-    {"step_name": "idea_screen", "phase": 1, "phase_name": "Screening", "step_order": 1, "depends_on": [], "model": "opus"},
+    {"step_name": "idea_screen", "phase": 1, "phase_name": "Screening", "step_order": 1, "depends_on": [], "model": "sonnet"},
     # Phase 2: Deep Research
-    {"step_name": "company_overview", "phase": 2, "phase_name": "Deep Research", "step_order": 2, "depends_on": ["idea_screen"], "model": "opus"},
+    {"step_name": "company_overview", "phase": 2, "phase_name": "Deep Research", "step_order": 2, "depends_on": ["idea_screen"], "model": "sonnet"},
     {"step_name": "business_model", "phase": 2, "phase_name": "Deep Research", "step_order": 3, "depends_on": ["company_overview"], "model": "opus"},
-    {"step_name": "competitive_position", "phase": 2, "phase_name": "Deep Research", "step_order": 4, "depends_on": ["company_overview"], "model": "opus"},
-    {"step_name": "industry_analysis", "phase": 2, "phase_name": "Deep Research", "step_order": 5, "depends_on": ["company_overview"], "model": "opus"},
+    {"step_name": "competitive_position", "phase": 2, "phase_name": "Deep Research", "step_order": 4, "depends_on": ["company_overview"], "model": "sonnet"},
+    {"step_name": "industry_analysis", "phase": 2, "phase_name": "Deep Research", "step_order": 5, "depends_on": ["company_overview"], "model": "sonnet"},
     {"step_name": "financial_analysis", "phase": 2, "phase_name": "Deep Research", "step_order": 6, "depends_on": ["company_overview"], "model": "sonnet"},
     {"step_name": "valuation", "phase": 2, "phase_name": "Deep Research", "step_order": 7, "depends_on": ["financial_analysis", "industry_analysis"], "model": "sonnet"},
     {"step_name": "research_sufficiency_gate", "phase": 2, "phase_name": "Deep Research", "step_order": 8, "depends_on": ["valuation", "competitive_position", "industry_analysis"], "model": "none", "retry_strategy": "with_parent"},
@@ -56,18 +58,20 @@ HFRT_WORKFLOW_STEPS = [
     {"step_name": "risk_analysis", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 11, "depends_on": ["fetch_sec_filings"], "model": "opus"},
     {"step_name": "quality_of_earnings", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 12, "depends_on": ["fetch_sec_filings"], "model": "opus"},
     {"step_name": "dd_sufficiency_gate", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 13, "depends_on": ["management_assessment", "risk_analysis", "quality_of_earnings"], "model": "none", "retry_strategy": "with_parent"},
+    # Gap 1: External validation (Perplexity-grounded) — runs in parallel with dialectic
+    {"step_name": "external_validation", "phase": 3, "phase_name": "Risk & Due Diligence", "step_order": 14, "depends_on": ["dd_sufficiency_gate"], "model": "sonnet"},
     # Phase 4: Dialectic
-    {"step_name": "bull_case", "phase": 4, "phase_name": "Dialectic", "step_order": 14, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
-    {"step_name": "bear_case", "phase": 4, "phase_name": "Dialectic", "step_order": 15, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
+    {"step_name": "bull_case", "phase": 4, "phase_name": "Dialectic", "step_order": 15, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
+    {"step_name": "bear_case", "phase": 4, "phase_name": "Dialectic", "step_order": 16, "depends_on": ["dd_sufficiency_gate"], "model": "opus"},
     # Phase 5: Synthesis
-    {"step_name": "catalyst_analysis", "phase": 5, "phase_name": "Synthesis", "step_order": 16, "depends_on": ["bull_case", "bear_case"], "model": "sonnet"},
-    {"step_name": "investment_thesis", "phase": 5, "phase_name": "Synthesis", "step_order": 17, "depends_on": ["bull_case", "bear_case"], "model": "opus"},
-    {"step_name": "bull_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 18, "depends_on": ["investment_thesis"], "model": "sonnet"},
-    {"step_name": "bear_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 19, "depends_on": ["investment_thesis"], "model": "sonnet"},
-    {"step_name": "thesis_coherence_gate", "phase": 5, "phase_name": "Synthesis", "step_order": 20, "depends_on": ["bull_synthesis", "bear_synthesis", "catalyst_analysis"], "model": "none", "retry_strategy": "with_parent"},
-    {"step_name": "investment_memo", "phase": 5, "phase_name": "Synthesis", "step_order": 21, "depends_on": ["thesis_coherence_gate"], "model": "opus"},
-    {"step_name": "research_certification", "phase": 5, "phase_name": "Synthesis", "step_order": 22, "depends_on": ["thesis_coherence_gate"], "model": "sonnet"},
-    {"step_name": "complete", "phase": 5, "phase_name": "Synthesis", "step_order": 23, "depends_on": ["investment_memo", "research_certification"], "model": "none"},
+    {"step_name": "catalyst_analysis", "phase": 5, "phase_name": "Synthesis", "step_order": 17, "depends_on": ["bull_case", "bear_case"], "model": "sonnet"},
+    {"step_name": "investment_thesis", "phase": 5, "phase_name": "Synthesis", "step_order": 18, "depends_on": ["bull_case", "bear_case"], "model": "opus"},
+    {"step_name": "bull_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 19, "depends_on": ["investment_thesis"], "model": "sonnet"},
+    {"step_name": "bear_synthesis", "phase": 5, "phase_name": "Synthesis", "step_order": 20, "depends_on": ["investment_thesis"], "model": "sonnet"},
+    {"step_name": "thesis_coherence_gate", "phase": 5, "phase_name": "Synthesis", "step_order": 21, "depends_on": ["bull_synthesis", "bear_synthesis", "catalyst_analysis"], "model": "none", "retry_strategy": "with_parent"},
+    {"step_name": "investment_memo", "phase": 5, "phase_name": "Synthesis", "step_order": 22, "depends_on": ["thesis_coherence_gate"], "model": "sonnet"},
+    {"step_name": "research_certification", "phase": 5, "phase_name": "Synthesis", "step_order": 23, "depends_on": ["thesis_coherence_gate"], "model": "sonnet"},
+    {"step_name": "complete", "phase": 5, "phase_name": "Synthesis", "step_order": 24, "depends_on": ["investment_memo", "research_certification"], "model": "none"},
 ]
 
 # Template definitions: number -> name
@@ -107,7 +111,7 @@ def create_project(
 ):
     """Create a new HFRT research project for a ticker.
 
-    Creates HFRTProject, WorkflowRun with 23 steps, and 15 empty templates.
+    Creates HFRTProject, WorkflowRun with 24 steps, and 15 empty templates.
     Rate limited to 5 creations per hour.
     """
     # Security: enforce global active workflow limit
@@ -336,7 +340,7 @@ async def rerun_project(project_id: int, db: Session = Depends(get_db)):
     run.completed_at = None
     run.updated_at = datetime.now(timezone.utc)
 
-    # Recreate all 23 HFRT workflow steps
+    # Recreate all 24 HFRT workflow steps
     for step_def in HFRT_WORKFLOW_STEPS:
         step = WorkflowStep(
             workflow_run_id=run.id,
@@ -840,6 +844,50 @@ def get_dialectic_audit(project_id: int, db: Session = Depends(get_db)):
         "projectId": project_id,
         "isIsolated": result["is_isolated"],
         "contaminationEvidence": result["contamination_evidence"],
+    }
+
+
+# ── GET /api/hfrt/projects/{id}/validation — External Validation (Gap 1) ────
+
+
+@router.get("/projects/{project_id}/validation")
+def get_validation(project_id: int, db: Session = Depends(get_db)):
+    """Get external validation results for a project (Gap 1).
+
+    Returns Perplexity-grounded fact-checking results with verdict breakdown:
+      confirmed, partially_confirmed, contradicted, unvalidatable.
+    """
+    project = db.query(HFRTProject).filter(HFRTProject.id == project_id).first()
+    if not project:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("NOT_FOUND", f"Project {project_id} not found"),
+        )
+
+    if not project.external_validation_results:
+        raise HTTPException(
+            status_code=404,
+            detail=_error("NOT_FOUND", "External validation has not been run for this project"),
+        )
+
+    try:
+        results = json.loads(project.external_validation_results)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=500,
+            detail=_error("PARSE_ERROR", "Could not parse stored validation results"),
+        )
+
+    return {
+        "projectId": project_id,
+        "claimsValidated": results.get("claims_validated", 0),
+        "confirmed": results.get("confirmed", 0),
+        "partiallyConfirmed": results.get("partially_confirmed", 0),
+        "contradicted": results.get("contradicted", 0),
+        "unvalidatable": results.get("unvalidatable", 0),
+        "overallConfidence": results.get("overall_confidence", ""),
+        "keyContradictions": results.get("key_contradictions", []),
+        "items": results.get("items", []),
     }
 
 

@@ -61,7 +61,7 @@ class TestModelIDs:
         assert MODEL_IDS["opus"] == "claude-opus-4-6"
 
     def test_sonnet_model_id(self):
-        assert MODEL_IDS["sonnet"] == "claude-sonnet-4-5-20250929"
+        assert MODEL_IDS["sonnet"] == "claude-sonnet-4-6"
 
     def test_only_two_tiers(self):
         """Only opus and sonnet should be in the mapping."""
@@ -77,7 +77,7 @@ class TestResolveModelId:
         assert resolve_model_id("opus") == "claude-opus-4-6"
 
     def test_resolves_sonnet(self):
-        assert resolve_model_id("sonnet") == "claude-sonnet-4-5-20250929"
+        assert resolve_model_id("sonnet") == "claude-sonnet-4-6"
 
     def test_passes_through_full_model_id(self):
         """Full model IDs with hyphens should pass through unchanged."""
@@ -236,11 +236,16 @@ class TestModelTierInDatabase:
 
         # Verify specific known tiers
         step_tiers = {s.step_name: s.model_tier for s in steps}
-        assert step_tiers["content_extraction"] == "opus"
+        assert step_tiers["content_extraction"] == "sonnet"  # data structuring
         assert step_tiers["source_bias_assessment"] == "sonnet"
+        assert step_tiers["bottleneck_mapping"] == "opus"  # causal reasoning
+        assert step_tiers["demand_modeling"] == "sonnet"  # Perplexity provides TAM data
+        assert step_tiers["external_validation"] == "sonnet"  # Perplexity does search
         assert step_tiers["content_sufficiency_gate"] == "none"
-        assert step_tiers["tier_classification"] == "sonnet"
-        assert step_tiers["dialectic_synthesis"] == "opus"
+        assert step_tiers["effects_analysis"] == "opus"  # 2nd/3rd order reasoning
+        assert step_tiers["dialectic_synthesis"] == "opus"  # reconciliation reasoning
+        assert step_tiers["master_screen"] == "sonnet"  # ranking from existing data
+        assert step_tiers["report_generation"] == "sonnet"  # prose from existing data
         assert step_tiers["hfrt_handoff_generation"] == "sonnet"
 
     def test_model_tier_nullable(self, db):
@@ -314,7 +319,7 @@ class TestCallClaudeModelResolution:
             )
 
         call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs.kwargs["model"] == "claude-sonnet-4-5-20250929"
+        assert call_kwargs.kwargs["model"] == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
     async def test_call_claude_raw_uses_tier(self):
@@ -354,3 +359,132 @@ class TestCallClaudeModelResolution:
 
         call_kwargs = mock_client.messages.create.call_args
         assert call_kwargs.kwargs["model"] == settings.claude_model
+
+
+# ── get_step_model_tier tests ─────────────────────────────────────────────
+
+
+class TestGetStepModelTier:
+    """Tests for get_step_model_tier lookup function."""
+
+    @pytest.mark.asyncio
+    async def test_returns_model_tier_from_db(self, db):
+        """Should return the model_tier stored on the workflow step."""
+        from app.models.workflow import WorkflowRun, WorkflowStep
+        from app.services.claude_client import get_step_model_tier
+
+        run = WorkflowRun(
+            workflow_type="IST",
+            name="Tier Lookup Test",
+            status="RUNNING",
+            current_phase=1,
+        )
+        db.add(run)
+        db.flush()
+
+        step = WorkflowStep(
+            workflow_run_id=run.id,
+            step_name="bottleneck_mapping",
+            phase=1,
+            phase_name="Test",
+            step_order=1,
+            status="RUNNING",
+            model_tier="opus",
+        )
+        db.add(step)
+        db.commit()
+
+        # Patch SessionLocal so get_step_model_tier uses the test session
+        with patch("app.database.SessionLocal", return_value=db):
+            result = await get_step_model_tier(run.id, "bottleneck_mapping")
+        assert result == "opus"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_step_not_found(self):
+        """Should return None if no matching step exists."""
+        from app.services.claude_client import get_step_model_tier
+
+        result = await get_step_model_tier(999999, "nonexistent_step")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_model_tier_is_null(self, db):
+        """Should return None if model_tier column is NULL."""
+        from app.models.workflow import WorkflowRun, WorkflowStep
+        from app.services.claude_client import get_step_model_tier
+
+        run = WorkflowRun(
+            workflow_type="IST",
+            name="Null Tier Test",
+            status="RUNNING",
+            current_phase=1,
+        )
+        db.add(run)
+        db.flush()
+
+        step = WorkflowStep(
+            workflow_run_id=run.id,
+            step_name="test_step",
+            phase=1,
+            phase_name="Test",
+            step_order=1,
+            status="RUNNING",
+            # model_tier intentionally omitted
+        )
+        db.add(step)
+        db.commit()
+
+        result = await get_step_model_tier(run.id, "test_step")
+        assert result is None
+
+
+# ── Perplexity client tests ───────────────────────────────────────────────
+
+
+class TestPerplexityClient:
+    """Tests for the Perplexity client module."""
+
+    def test_is_available_without_key(self):
+        """Should return False when no API key is configured."""
+        from app.services.perplexity_client import is_available
+        with patch("app.services.perplexity_client.settings") as mock_settings:
+            mock_settings.perplexity_api_key = ""
+            assert is_available() is False
+
+    def test_is_available_with_key(self):
+        """Should return True when API key is configured."""
+        from app.services.perplexity_client import is_available
+        with patch("app.services.perplexity_client.settings") as mock_settings:
+            mock_settings.perplexity_api_key = "pplx-test-key"
+            assert is_available() is True
+
+    def test_token_tracking(self):
+        """Per-workflow token tracking should work correctly."""
+        from app.services.perplexity_client import (
+            get_workflow_perplexity_usage,
+            clear_workflow_perplexity_usage,
+            _workflow_perplexity_usage,
+        )
+
+        # Clean state
+        _workflow_perplexity_usage.clear()
+
+        assert get_workflow_perplexity_usage(1) == 0
+
+        _workflow_perplexity_usage[1] = 500
+        assert get_workflow_perplexity_usage(1) == 500
+
+        clear_workflow_perplexity_usage(1)
+        assert get_workflow_perplexity_usage(1) == 0
+
+    @pytest.mark.asyncio
+    async def test_search_and_analyze_raises_without_key(self):
+        """Should raise RuntimeError when Perplexity is not configured."""
+        from app.services.perplexity_client import search_and_analyze
+        with patch("app.services.perplexity_client.settings") as mock_settings:
+            mock_settings.perplexity_api_key = ""
+            with pytest.raises(RuntimeError, match="not configured"):
+                await search_and_analyze(
+                    system_prompt="test",
+                    user_prompt="test",
+                )
